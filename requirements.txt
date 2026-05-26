@@ -2,7 +2,7 @@ langgraph==0.2.45
 langchain==0.3.14
 langchain-openai==0.2.11
 langchain-community==0.3.14
-langchain-core==0.3.28
+langchain-core>=0.3.0,<0.4.0
 faiss-cpu==1.14.2
 openai==1.51.2
 reportlab==4.2.2
