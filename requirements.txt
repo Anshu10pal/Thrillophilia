@@ -14,7 +14,7 @@ requests==2.32.3
 streamlit==1.35.0
 httpx==0.28.1
 json-repair==0.29.0
-langsmith==0.1.163
+langsmith==0.1.147
 aiohttp==3.10.5
 SQLAlchemy==2.0.35
 tenacity==8.5.0
