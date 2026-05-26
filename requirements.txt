@@ -20,7 +20,7 @@ langsmith==0.2.6
 # VECTOR DATABASE
 # =========================
 
-faiss-cpu==1.8.0.post1
+faiss-cpu==1.14.2
 
 # =========================
 # DOCUMENT PROCESSING
