@@ -1,0 +1,32 @@
+# Environment and secrets
+.env
+*.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyo
+.venv/
+venv/
+.venv
+env/
+
+# FAISS index (large binary files)
+data/faiss_travel_index/
+
+# Generated outputs
+output/
+*.pdf
+
+# Cache
+trip_cache/
+*.db
+
+# VS Code
+.vscode/
+
+# Windows
+Thumbs.db
+desktop.ini
