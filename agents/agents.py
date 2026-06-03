@@ -1,23 +1,19 @@
 """
-agents/agents.py — Trip Planner Agents
-=======================================
-Version: Final (all bugs fixed)
-Fixes applied:
-  - timeout=30, max_retries=0 (fail fast during gateway overload)
-  - _llm_call returns "" on failure (triggers fallbacks correctly)
-  - _parse_json_robust raises on empty/error input
-  - CITY_ALIASES: Banglore→Bangalore, Bombay→Mumbai etc
-  - _normalise_city applied to source + destination
-  - Transport fallback uses live route data for real price estimates
-  - Itinerary fallback uses themed day structure with activity pool
-  - Places generates stub attractions/restaurants when APIs fail
-  - hotel_agent: travel_type defined before use (no NameError)
-  - LLM activity bank for unique per-day activities (any destination)
-  - Per-day itinerary generation (stays within 500-token gateway limit)
-  - Budget calculated directly (no LLM, no tip1/tip2 placeholders)
-  - Hotels: 3 separate calls per tier (Budget/Best Value/Comfort)
-  - Places: deduplicated, 3 separate calls with real prices
-  - end_date derived from start_date + num_days for Xotelo
+agents/agents.py — All Specialized Agents for the Trip Planner
+==============================================================
+Fixes in this version:
+  1. user_input_agent: regex + LLM merge, multi-stop routes, transport hints,
+     stopover cities, "from X" parsing, city normalisation, travel_type fallback
+  2. clarification_agent: ONLY asks for fields that are truly missing after
+     thorough extraction. Never asks about something the user already said.
+  3. transport_agent: passes transport_preference to fetch_route_distance
+     so ORS returns 'car' when user says 'by car'
+  4. places_agent: limits LLM enrichment input to prevent truncation;
+     falls back to raw Geoapify data if LLM returns fewer places
+  5. All JSON parsing uses _parse_json_robust() with json_repair fallback
+  6. itinerary_agent: compact prompt + dedicated 8000-token LLM instance
+  7. get_llm: timeout=30, max_retries=0, OPENAI_BASE_URL gateway support
+  8. CITY_ALIASES: Banglore→Bangalore, Bombay→Mumbai etc + _normalise_city
 """
 
 import json
@@ -39,6 +35,19 @@ from config import (
 )
 from state import TripState
 
+
+
+# LangSmith tracing
+try:
+    from langsmith import traceable
+    LANGSMITH_AVAILABLE = True
+except ImportError:
+    # Graceful fallback — define a no-op decorator
+    def traceable(**kwargs):
+        def decorator(fn): return fn
+        return decorator
+    LANGSMITH_AVAILABLE = False
+
 logger = logging.getLogger("trip_planner.agents")
 
 # ── City name aliases — normalise misspellings before geocoding ───────────────
@@ -53,18 +62,17 @@ CITY_ALIASES: dict = {
 
 
 def _normalise_city(name: str) -> str:
-    """Normalise city name — fix common misspellings."""
     if not name: return name
     return CITY_ALIASES.get(name.strip().lower(), name.strip().title())
-
 
 # ── json_repair ───────────────────────────────────────────────────────────────
 JSON_REPAIR_AVAILABLE = False
 try:
     from json_repair import repair_json
     JSON_REPAIR_AVAILABLE = True
+    logger.info("json_repair available ✓")
 except ImportError:
-    pass
+    logger.warning("json_repair not installed — run: pip install json-repair")
 
 # ── Live APIs ─────────────────────────────────────────────────────────────────
 LIVE_APIS_AVAILABLE = False
@@ -75,23 +83,24 @@ try:
     )
     LIVE_APIS_AVAILABLE = True
 except ImportError:
-    logger.warning("live_apis not found — LLM fallback only")
+    logger.warning("live_apis not found — using LLM fallback")
 
 # ── Guardrails ────────────────────────────────────────────────────────────────
 GUARDRAILS_AVAILABLE = False
 try:
     from tools.guardrails import (
         retrieval_guard, output_guard, output_guard_itinerary,
-        tool_guard, pii_masker, hallucination_guard,
+        tool_guard, pii_masker, hallucination_guard
     )
     GUARDRAILS_AVAILABLE = True
 except ImportError:
-    pass
+    logger.warning("guardrails not found — guardrails disabled")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# LLM FACTORY
+# SHARED LLM HELPERS
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 def get_llm(max_tokens: int = None) -> ChatOpenAI:
     kwargs = dict(
@@ -100,13 +109,13 @@ def get_llm(max_tokens: int = None) -> ChatOpenAI:
         max_tokens=max_tokens or LLM_MAX_TOKENS,
         openai_api_key=OPENAI_API_KEY,
         timeout=30,
-        max_retries=0,   # fail fast — no retry during gateway overload
+        max_retries=0,
     )
     if OPENAI_BASE_URL:
         kwargs["base_url"] = OPENAI_BASE_URL
     return ChatOpenAI(**kwargs)
 
-
+@traceable(name="llm_call_standard", run_type="llm")
 def _llm_call(system: str, human: str) -> str:
     try:
         llm  = get_llm()
@@ -114,10 +123,10 @@ def _llm_call(system: str, human: str) -> str:
         return resp.content.strip()
     except Exception as e:
         logger.error("[LLM] Call failed: %s", e)
-        return ""   # empty string triggers except in every agent → fallback runs
+        return ""
 
-
-def _llm_call_high_tokens(system: str, human: str, max_tokens: int = 500) -> str:
+@traceable(name="llm_call_high_tokens", run_type="llm", metadata={"max_tokens": 8000})
+def _llm_call_high_tokens(system: str, human: str, max_tokens: int = 8000) -> str:
     try:
         llm  = get_llm(max_tokens=max_tokens)
         resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=human)])
@@ -129,14 +138,16 @@ def _llm_call_high_tokens(system: str, human: str, max_tokens: int = 500) -> str
 
 def _parse_json_robust(raw: str) -> dict:
     if not raw or not raw.strip() or raw.startswith("[LLM Error"):
-        raise json.JSONDecodeError("Empty or error response — using fallback", raw or "", 0)
+        raise json.JSONDecodeError("Empty or error response", raw or "", 0)
     clean = raw.strip()
-    for fence in ["```json", "```"]:
-        if fence in clean:
-            parts = clean.split(fence)
-            clean = parts[1] if len(parts) > 1 else clean
-    clean = clean.strip().strip("`")
+    if "```" in clean:
+        parts = clean.split("```")
+        clean = parts[1] if len(parts) > 1 else clean
+        if clean.startswith("json"):
+            clean = clean[4:]
+    clean = clean.strip()
     clean = clean.replace('\u201c', '"').replace('\u201d', '"')
+    clean = clean.replace('\u2018', "'").replace('\u2019', "'")
     clean = _re.sub(r',\s*([}\]])', r'\1', clean)
     try:
         result = json.loads(clean)
@@ -154,9 +165,10 @@ def _parse_json_robust(raw: str) -> dict:
                 extracted_days = _extract_days_from_broken_json(clean)
                 if len(extracted_days) > len(result["days"]):
                     result["days"] = extracted_days
+            logger.info("JSON repair successful ✓")
             return result
-        except Exception:
-            pass
+        except Exception as re_err:
+            logger.error("JSON repair also failed: %s", re_err)
     raise json.JSONDecodeError("Could not parse", clean, 0)
 
 
@@ -173,19 +185,31 @@ def _extract_days_from_broken_json(text: str) -> list:
     return sorted(days, key=lambda d: d.get("day", 0))
 
 
-def _f(val, default: float = 0.0) -> float:
-    try:    return float(val)
-    except: return default
-
-
 def _tool_allowed(tool_name: str, params: dict) -> bool:
     if not GUARDRAILS_AVAILABLE:
         return True
     try:
         result = tool_guard(tool_name, params)
-        return not result.blocked
+        if result.blocked:
+            logger.warning("[ToolGuard] Blocked '%s': %s", tool_name, result.reason)
+            return False
+        return True
     except Exception:
         return True
+
+
+def _apply_output_guard(text: str, prefs: dict) -> str:
+    if not GUARDRAILS_AVAILABLE:
+        return text
+    result = output_guard(text, prefs)
+    if result.blocked:
+        return "{}"
+    return result.clean
+
+
+def _f(val, default: float = 0.0) -> float:
+    try:    return float(val)
+    except: return default
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -194,19 +218,19 @@ def _tool_allowed(tool_name: str, params: dict) -> bool:
 
 def _regex_extract(text: str) -> Dict[str, Any]:
     t   = text.lower()
-    out = {}
+    out: Dict[str, Any] = {}
 
     m = _re.search(r'(\d+)\s*(?:-?\s*day|days?|night|nights?)', t)
     if m: out["num_days"] = int(m.group(1))
 
-    m = _re.search(r'(?:budget|₹|rs\.?|inr|usd|\$)\s*([\d,]+)', t)
+    m = _re.search(r'(?:budget|rs\.?|inr|usd|\$)\s*([\d,]+)', t)
     if m:
         out["budget"]   = int(m.group(1).replace(",", ""))
-        out["currency"] = "INR" if any(x in t for x in ["₹","inr","rs"]) else "USD"
+        out["currency"] = "INR" if any(x in t for x in ["inr","rs"]) else "USD"
 
     m = _re.search(r'(\d+)\s+(?:people|persons?|travelers?|pax|of us)', t)
     if m: out["travelers"] = int(m.group(1))
-    if "wife" in t or "husband" in t or "partner" in t or "honeymoon" in t:
+    if any(x in t for x in ["wife","husband","partner","honeymoon"]):
         out.setdefault("travelers", 2); out["travel_type"] = "couple"
     if "family" in t: out.setdefault("travel_type", "family")
     if "solo" in t:   out.setdefault("travelers", 1); out["travel_type"] = "solo"
@@ -230,32 +254,55 @@ def _regex_extract(text: str) -> Dict[str, Any]:
     return out
 
 
+@traceable(name="UserInputAgent", run_type="chain")
 def user_input_agent(state: TripState) -> Dict[str, Any]:
-    logger.info("[UserInputAgent] Parsing: %s", str(state.get("user_query",""))[:100])
+    logger.info("[UserInputAgent] Parsing: %s", state.get("user_query", "")[:100])
 
     query    = state.get("user_query", "")
     existing = state.get("trip_preferences", {}) or {}
 
     regex_prefs = _regex_extract(query)
 
-    system = """Extract ALL trip details from the user query.
-Return ONLY valid JSON (no markdown):
-{"source":"city or null","destination":"city","stopovers":[],"start_date":"YYYY-MM-DD or null","end_date":null,"num_days":null,"budget":null,"currency":"INR","travelers":null,"travel_type":"couple/solo/family/friends or null","transport_preference":"flight/train/bus/car or null","hotel_preference":null,"food_preference":null,"interests":[],"special_requests":null}"""
+    system = """You are a travel assistant. Extract ALL trip details from the user query.
+Return ONLY a JSON object (no markdown, no explanation, no array):
+{
+  "source": "origin city or null",
+  "destination": "final destination city/country",
+  "stopovers": ["city1", "city2"],
+  "start_date": "YYYY-MM-DD or description or null",
+  "end_date": "YYYY-MM-DD or description or null",
+  "num_days": integer or null,
+  "budget": numeric or null,
+  "currency": "INR or USD or EUR",
+  "travelers": integer or null,
+  "travel_type": "solo/couple/family/friends/business or null",
+  "transport_preference": "flight/train/bus/car or null",
+  "hotel_preference": "resort/hotel/hostel/villa/houseboat or null",
+  "food_preference": "vegetarian/non-veg/vegan/seafood/any or null",
+  "interests": ["list", "of", "interests"],
+  "special_requests": "any extra notes or null"
+}"""
 
-    history      = state.get("conversation_history", [])
     history_text = ""
-    if history:
-        history_text = "\n\nHistory:\n" + "\n".join(
-            f"{m['role'].upper()}: {m['content']}" for m in history[-4:]
+    if state.get("conversation_history"):
+        history_text = "\n\nConversation history:\n" + "\n".join(
+            f"{m['role'].upper()}: {m['content']}"
+            for m in state["conversation_history"][-6:]
         )
 
-    raw       = _llm_call(system, f"Query: {query}{history_text}")
-    llm_prefs = {}
-    if raw:
-        try:
-            llm_prefs = _parse_json_robust(raw)
-        except Exception:
-            logger.warning("[UserInputAgent] Could not parse LLM JSON — using regex only")
+    raw = _llm_call(system, f"User query: {query}{history_text}")
+
+    llm_prefs: Dict[str, Any] = {}
+    try:
+        parsed = _parse_json_robust(raw)
+        if isinstance(parsed, list):
+            parsed = parsed[0] if parsed else {}
+        if isinstance(parsed, dict):
+            llm_prefs = parsed
+        else:
+            logger.warning("[UserInputAgent] Parsed result is %s — skipping", type(parsed))
+    except Exception as e:
+        logger.warning("[UserInputAgent] Could not parse LLM JSON: %s — using regex only", e)
 
     merged = {**existing}
     for k, v in regex_prefs.items():
@@ -264,7 +311,7 @@ Return ONLY valid JSON (no markdown):
         if v is not None and v != "" and v != [] and str(v).lower() not in ("null","none","unknown"):
             merged[k] = v
 
-    # Travel type fallback — never let it be None (crashes pdf_generator)
+    # Travel type fallback — never let it be None
     if not merged.get("travel_type"):
         q_lower = query.lower()
         if any(x in q_lower for x in ["wife","husband","honeymoon","partner","couple"]):
@@ -278,60 +325,69 @@ Return ONLY valid JSON (no markdown):
         else:
             merged["travel_type"] = "general"
 
-    if not merged.get("currency"):
-        merged["currency"] = "USD" if any(x in query.lower() for x in ["$","usd"]) else "INR"
-
-    sd = str(merged.get("start_date","")).lower()
-    if sd and not _re.match(r"\d{4}-\d{2}-\d{2}", sd):
+    # Normalise vague date descriptions → concrete YYYY-MM-DD
+    if merged.get("start_date") and not _re.match(r"\d{4}-\d{2}-\d{2}", str(merged.get("start_date", ""))):
         from datetime import datetime as _dt, timedelta as _td
-        today     = _dt.now()
-        month_map = {"january":"01","february":"02","march":"03","april":"04","may":"05",
-                     "june":"06","july":"07","august":"08","september":"09",
-                     "october":"10","november":"11","december":"12"}
-        resolved  = None
-        for mn, mm in month_map.items():
-            if mn in sd:
-                yr       = today.year if int(mm) >= today.month else today.year + 1
-                day      = "15" if "mid" in sd else ("01" if any(x in sd for x in ["early","start"]) else "20")
-                resolved = f"{yr}-{mm}-{day}"
+        _today = _dt.now()
+        _vague = str(merged["start_date"]).lower()
+        _month_map = {
+            "january": "01", "february": "02", "march": "03", "april": "04",
+            "may": "05", "june": "06", "july": "07", "august": "08",
+            "september": "09", "october": "10", "november": "11", "december": "12"
+        }
+        _resolved = None
+        for _month_name, _month_num in _month_map.items():
+            if _month_name in _vague:
+                _yr  = _today.year if int(_month_num) >= _today.month else _today.year + 1
+                _day = "15" if "mid" in _vague else ("01" if "early" in _vague else "25")
+                _resolved = f"{_yr}-{_month_num}-{_day}"
                 break
-        if not resolved:
-            if "next week"   in sd: resolved = (_dt.now() + _td(weeks=1)).strftime("%Y-%m-%d")
-            elif "next month" in sd:
-                nm = (_dt.now().replace(day=1) + _td(days=32)).replace(day=1)
-                resolved = nm.strftime("%Y-%m-%d")
-        if resolved:
-            merged["start_date"] = resolved
+        if not _resolved:
+            if "next week"   in _vague: _resolved = (_today + _td(weeks=1)).strftime("%Y-%m-%d")
+            elif "next month" in _vague:
+                _nm = (_today.replace(day=1) + _td(days=32)).replace(day=1)
+                _resolved = _nm.strftime("%Y-%m-%d")
+            elif "tomorrow"  in _vague: _resolved = (_today + _td(days=1)).strftime("%Y-%m-%d")
+        if _resolved:
+            logger.info("[UserInputAgent] Normalised date '%s' → '%s'", merged["start_date"], _resolved)
+            merged["start_date"] = _resolved
             if merged.get("num_days") and not merged.get("end_date"):
-                from datetime import datetime as _dt2, timedelta as _td2
-                s = _dt2.strptime(resolved, "%Y-%m-%d")
-                merged["end_date"] = (s + _td2(days=int(merged["num_days"])-1)).strftime("%Y-%m-%d")
+                _start = _dt.strptime(_resolved, "%Y-%m-%d")
+                merged["end_date"] = (_start + _td(days=int(merged["num_days"]) - 1)).strftime("%Y-%m-%d")
 
-    # Normalise city names (fix misspellings)
+    # Derive currency
+    if not merged.get("currency"):
+        q = query.lower()
+        if "$" in q or "usd" in q:    merged["currency"] = "USD"
+        elif "€" in q or "eur" in q:  merged["currency"] = "EUR"
+        else:                         merged["currency"] = "INR"
+
+    # Normalise city names (fix common misspellings)
     if merged.get("destination"):
         merged["destination"] = _normalise_city(merged["destination"])
     if merged.get("source"):
         merged["source"] = _normalise_city(merged["source"])
 
-    # Guard: source == destination means planning_service rewrote the query
+    # Guard: source == destination
     if merged.get("source") and merged.get("destination"):
         if merged["source"].lower().strip() == merged["destination"].lower().strip():
             logger.warning("[UserInputAgent] source==destination (%s) — clearing source", merged["source"])
             merged.pop("source", None)
 
     logger.info(
-        "[UserInputAgent] dest=%s src=%s days=%s budget=%s travelers=%s transport=%s",
+        "[UserInputAgent] Extracted: dest=%s source=%s days=%s budget=%s travelers=%s transport=%s",
         merged.get("destination"), merged.get("source"), merged.get("num_days"),
-        merged.get("budget"), merged.get("travelers"), merged.get("transport_preference"),
+        merged.get("budget"), merged.get("travelers"), merged.get("transport_preference")
     )
-    return {"trip_preferences": merged, "current_agent": "user_input_agent"}
 
+    return {"trip_preferences": merged, "current_agent": "user_input_agent"}
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 1b. CLARIFICATION AGENT
 # ═════════════════════════════════════════════════════════════════════════════
 
 REQUIRED_FIELDS = ["destination", "num_days", "budget", "travelers", "source"]
+
 FIELD_QUESTIONS = {
     "destination":  "Where do you want to go? (e.g. Goa, Dubai, Bali)",
     "source":       "Where are you travelling from? (your departure city)",
@@ -341,16 +397,21 @@ FIELD_QUESTIONS = {
 }
 
 
+@traceable(name="ClarificationAgent", run_type="chain") 
 def clarification_agent(state: TripState) -> Dict[str, Any]:
-    prefs   = state.get("trip_preferences", {}) or {}
-    answers = state.get("clarification_answers", {}) or {}
+    """
+    Check ONLY for genuinely missing fields.
+    Never asks about something the user already provided.
+    """
+    prefs   = state.get("trip_preferences", {})
+    answers = state.get("clarification_answers", {})
     merged  = {**prefs, **answers}
 
     def _missing(field: str) -> bool:
         val = merged.get(field)
-        if val is None: return True
-        if isinstance(val, str) and val.strip().lower() in ("","null","none","unknown"): return True
-        if isinstance(val, (int,float)) and val == 0: return True
+        if val is None:                  return True
+        if isinstance(val, str) and val.strip().lower() in ("", "null", "none", "unknown"): return True
+        if isinstance(val, (int, float)) and val == 0:  return True
         return False
 
     missing = [f for f in REQUIRED_FIELDS if _missing(f)]
@@ -358,418 +419,419 @@ def clarification_agent(state: TripState) -> Dict[str, Any]:
     if missing:
         nxt      = missing[0]
         question = FIELD_QUESTIONS.get(nxt, f"Could you tell me your {nxt}?")
+        logger.info("[ClarificationAgent] Still missing: %s — asking about %s", missing, nxt)
         return {
-            "flow_stage": "clarifying", "missing_fields": missing,
-            "clarification_question": question, "trip_preferences": merged,
-            "current_agent": "clarification_agent",
+            "flow_stage":             "clarifying",
+            "missing_fields":         missing,
+            "clarification_question": question,
+            "trip_preferences":       merged,
+            "current_agent":          "clarification_agent",
         }
 
+    logger.info("[ClarificationAgent] All required fields present — ready to plan")
     return {
-        "flow_stage": "ready", "missing_fields": [],
-        "clarification_question": "", "trip_preferences": merged,
-        "current_agent": "clarification_agent",
+        "flow_stage":             "ready",
+        "missing_fields":         [],
+        "clarification_question": "",
+        "trip_preferences":       merged,
+        "current_agent":          "clarification_agent",
     }
 
 
 def absorb_clarification_answer(state: TripState, field: str, answer: str) -> Dict[str, Any]:
+    """Parse a clarification answer into the correct type."""
     answers = dict(state.get("clarification_answers", {}))
     prefs   = dict(state.get("trip_preferences", {}))
+
     if field == "num_days":
         try:    answers[field] = int("".join(filter(str.isdigit, answer))) or 5
         except: answers[field] = 5
     elif field == "budget":
-        nums = _re.findall(r"[\d]+", answer.replace(",",""))
+        nums = _re.findall(r"[\d,]+", answer.replace(",", ""))
         answers[field] = int(nums[0]) if nums else 0
-        if any(c in answer for c in ["$","USD","usd"]): prefs["currency"] = "USD"
-        else: prefs.setdefault("currency","INR")
+        if any(c in answer for c in ["$", "USD", "usd"]):   prefs["currency"] = "USD"
+        elif any(c in answer for c in ["€", "EUR", "eur"]): prefs["currency"] = "EUR"
+        else: prefs.setdefault("currency", "INR")
     elif field == "travelers":
         try:    answers[field] = int("".join(filter(str.isdigit, answer))) or 1
         except: answers[field] = 1
+    elif field == "interests":
+        answers[field] = [w.strip() for w in answer.replace(",", " ").split() if len(w) > 2]
     else:
         answers[field] = answer.strip()
+
     prefs.update(answers)
-    return {"clarification_answers": answers, "trip_preferences": prefs}
+    return {
+        "clarification_answers": answers,
+        "trip_preferences":      prefs,
+        "user_query":            f"Updated: {field}={answer}",
+    }
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 2. MEMORY AGENT
+# 2. MEMORY AGENT  (+ Retrieval Guardrail)
 # ═════════════════════════════════════════════════════════════════════════════
-
+@traceable(name="MemoryAgent", run_type="retriever")
 def memory_agent(state: TripState) -> Dict[str, Any]:
+    """FAISS retrieval with retrieval guardrail filtering."""
     logger.info("[MemoryAgent] Retrieving knowledge…")
+
     prefs       = state.get("trip_preferences", {})
-    destination = prefs.get("destination", state.get("user_query",""))
-    retrieved   = []
+    destination = prefs.get("destination", state.get("user_query", ""))
+    query       = f"{destination} travel hotels transport attractions"
+
+    from data.knowledge_base import similarity_search
+
     try:
-        from data.knowledge_base import similarity_search
-        raw_docs  = similarity_search(f"{destination} travel hotels transport attractions", k=6)
+        raw_docs  = similarity_search(query, k=8)
         doc_dicts = [{"content": d.page_content, "metadata": d.metadata} for d in raw_docs]
+
         if GUARDRAILS_AVAILABLE:
             doc_dicts = retrieval_guard(doc_dicts, destination=destination)
-        retrieved = [{"content":d["content"],"metadata":d["metadata"]} for d in doc_dicts]
+            logger.info("[MemoryAgent] Retrieval guardrail: %d docs passed", len(doc_dicts))
+
+        retrieved = [
+            {"content": d["content"], "metadata": d["metadata"], "relevance_score": None}
+            for d in doc_dicts
+        ]
+        logger.info("[MemoryAgent] Retrieved %d documents", len(retrieved))
+
     except Exception as e:
-        logger.warning("[MemoryAgent] Retrieval failed (non-fatal): %s", e)
+        logger.error("[MemoryAgent] Retrieval failed: %s", e)
+        retrieved = []
 
     categorised: Dict[str, List[str]] = {}
     for doc in retrieved:
-        cat = doc["metadata"].get("category","general")
-        categorised.setdefault(cat,[]).append(doc["content"])
+        cat = doc["metadata"].get("category", "general")
+        categorised.setdefault(cat, []).append(doc["content"])
 
     return {
         "retrieved_docs": retrieved,
-        "memory_context": {"categorised": categorised, "destination": destination, "doc_count": len(retrieved)},
+        "memory_context": {
+            "categorised": categorised,
+            "destination": destination,
+            "doc_count":   len(retrieved),
+        },
         "current_agent": "memory_agent",
     }
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 3. WEATHER AGENT
+# 3. WEATHER AGENT  (+ Tool Guardrail)
 # ═════════════════════════════════════════════════════════════════════════════
 
+@traceable(name="WeatherAgent", run_type="chain",
+           metadata={"uses_live_api": True})
 def weather_agent(state: TripState) -> Dict[str, Any]:
+    """Live weather via Open-Meteo → OWM → LLM fallback."""
     logger.info("[WeatherAgent] Fetching weather…")
+
     prefs       = state.get("trip_preferences", {})
-    destination = prefs.get("destination","")
-    start_date  = prefs.get("start_date","")
+    destination = prefs.get("destination", "")
+    start_date  = prefs.get("start_date", "")
     num_days    = prefs.get("num_days", 7)
+    dates       = f"{prefs.get('start_date','upcoming')} to {prefs.get('end_date','')}"
 
-    if LIVE_APIS_AVAILABLE and destination:
-        try:
-            if _tool_allowed("fetch_weather", {"destination": destination}):
-                live = fetch_weather(destination, start_date or None, num_days)
-                if live:
-                    logger.info("[WeatherAgent] ✅ Live: %s", live.get("source",""))
-                    return {"weather_data": live, "current_agent": "weather_agent"}
-        except Exception as e:
-            logger.warning("[WeatherAgent] Live API failed: %s", e)
+    if LIVE_APIS_AVAILABLE:
+        params = {"destination": destination, "num_days": num_days}
+        if _tool_allowed("fetch_weather", params):
+            live = fetch_weather(destination, start_date or None, num_days)
+            if live:
+                logger.info("[WeatherAgent] ✅ Live weather from %s", live.get("source"))
+                return {"weather_data": live, "current_agent": "weather_agent"}
 
-    system = 'Travel weather expert. Return ONLY valid JSON: {"source":"LLM estimate","destination":"...","avg_temp_day":"...","avg_temp_night":"...","conditions":"sunny/rainy/cold/snowy","rainfall":"low/moderate/high","clothing_advice":"...","weather_warnings":[],"beach_suitable":false,"outdoor_suitable":true,"weather_summary":"2-3 sentence summary"}'
-    raw    = _llm_call(system, f"Destination:{destination} StartDate:{start_date} Days:{num_days}")
+    # LLM fallback
+    memory       = state.get("memory_context", {})
+    weather_docs = memory.get("categorised", {}).get("weather", [])
+    context      = "\n".join(weather_docs[:2]) if weather_docs else ""
+
+    system = """You are a travel weather expert. Return ONLY JSON:
+{"source":"LLM estimate","destination":"...","travel_period":"...","avg_temp_day":"...","avg_temp_night":"...","conditions":"sunny/rainy/cold/snowy","rainfall":"low/moderate/high","clothing_advice":"...","weather_warnings":[],"beach_suitable":false,"outdoor_suitable":true,"weather_summary":"2-3 sentences"}"""
+
+    raw = _llm_call(system, f"Destination:{destination} Dates:{dates}")
     try:
         weather = _parse_json_robust(raw)
     except Exception:
         weather = {
-            "destination": destination, "source": "LLM estimate",
-            "conditions": "pleasant", "outdoor_suitable": True,
-            "beach_suitable": False, "clothing_advice": "Pack for all weather.",
-            "weather_summary": f"Weather for {destination} is generally pleasant.",
-            "weather_warnings": [], "avg_temp_day": "28°C", "avg_temp_night": "20°C",
+            "destination": destination, "travel_period": dates,
+            "weather_summary": raw[:300], "outdoor_suitable": True,
+            "beach_suitable": False, "source": "LLM estimate",
+            "conditions": "unknown", "clothing_advice": "Pack for all weather.",
         }
+
     return {"weather_data": weather, "current_agent": "weather_agent"}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 4. TRANSPORT AGENT
+# 4. TRANSPORT AGENT  (+ Tool Guardrail, respects transport_preference)
 # ═════════════════════════════════════════════════════════════════════════════
 
+@traceable(name="TransportAgent", run_type="chain")
 def transport_agent(state: TripState) -> Dict[str, Any]:
+    """
+    Live route via ORS → LLM enrichment.
+    Passes transport_preference to ORS so 'car' trips get car recommendation.
+    """
     logger.info("[TransportAgent] Finding transport…")
-    prefs          = state.get("trip_preferences", {})
-    source         = prefs.get("source","")
-    destination    = prefs.get("destination","")
-    transport_pref = (prefs.get("transport_preference") or "").lower()
-    num_travelers  = int(prefs.get("travelers") or 2)
-    budget         = _f(prefs.get("budget",0))
-    currency       = prefs.get("currency","INR")
-    num_days       = int(prefs.get("num_days") or 5)
-    stopovers      = prefs.get("stopovers",[])
-    transport_bgt  = budget * 0.25
 
+    prefs            = state.get("trip_preferences", {})
+    memory           = state.get("memory_context", {})
+    source           = prefs.get("source", "")
+    destination      = prefs.get("destination", "")
+    transport_pref   = (prefs.get("transport_preference") or "").lower()
+    num_travelers    = prefs.get("travelers", 2)
+    budget           = _f(prefs.get("budget", 0))
+    currency         = prefs.get("currency", "INR")
+    num_days         = prefs.get("num_days", 5)
+    stopovers        = prefs.get("stopovers", [])
+    transport_budget = budget * 0.25
+
+    # Try ORS with transport preference
     route_data = None
     if LIVE_APIS_AVAILABLE and source and destination:
-        try:
-            if _tool_allowed("fetch_route_distance",{"origin":source,"destination":destination}):
-                route_data = fetch_route_distance(source, destination, transport_pref)
-        except Exception as e:
-            logger.warning("[TransportAgent] ORS failed: %s", e)
+        params = {"origin": source, "destination": destination}
+        if _tool_allowed("fetch_route_distance", params):
+            route_data = fetch_route_distance(source, destination, transport_pref)
+            if route_data:
+                logger.info("[TransportAgent] ✅ Live route: %s", route_data.get("notes",""))
 
-    route_context    = ""
-    pref_instruction = ""
+    context_parts = memory.get("categorised", {}).get("transport", [])
+    context       = "\n".join(context_parts[:2]) if context_parts else ""
+
+    route_context = ""
     if route_data:
-        route_context = f"\nLIVE ROUTE: {route_data['distance_km']}km, {route_data['road_duration_h']}h, recommended:{route_data['recommended_mode']}"
-    if transport_pref:
-        pref_instruction = f"\nCRITICAL: User specified mode='{transport_pref}'. primary_option.mode MUST be '{transport_pref}'."
+        route_context = (
+            f"\nLIVE ROUTE (ORS): {route_data['distance_km']}km, "
+            f"{route_data['road_duration_h']}h drive, "
+            f"recommended:{route_data['recommended_mode']}, "
+            f"est:{currency}{route_data['estimated_cost_inr']}"
+        )
 
     stopover_note = f" Stopovers:{stopovers}" if stopovers else ""
 
-    # Call 1: primary option
-    system = (
-        f"Transport expert. {currency} prices only.{pref_instruction}"
-        f' Return ONLY minified JSON: {{"mode":"flight","operator":"IndiGo","duration":"3h","price_per_person":12000,"total_price":24000,"schedule":"Multiple daily","booking_platform":"MakeMyTrip","fits_budget":true,"local_transport_mode":"Metro/Taxi","local_daily_cost":800}}'
-    )
-    human = f"From:{source} To:{destination}{stopover_note} Travelers:{num_travelers} Budget:{currency}{transport_bgt:.0f} Pref:{transport_pref or 'any'}{route_context}"
-    raw   = _llm_call(system, human)
+    # IMPORTANT: explicitly enforce user preference in prompt
+    pref_instruction = ""
+    if transport_pref:
+        pref_instruction = (
+            f"\nCRITICAL: User has specified transport mode = '{transport_pref}'. "
+            f"The primary_option mode MUST be '{transport_pref}'. Do NOT change this."
+        )
 
-    # Call 2: alternatives
-    system2 = f'Transport alternatives from {source} to {destination}. Return ONLY minified JSON: {{"alternatives":[{{"mode":"train","operator":"Railway","duration":"...","price_per_person":0,"notes":"..."}},{{"mode":"bus","operator":"...","duration":"...","price_per_person":0,"notes":"..."}}]}}'
-    raw2    = _llm_call(system2, f"From:{source} To:{destination} Travelers:{num_travelers}")
+    system = (
+        f"You are a travel transport expert. "
+        f"Budget:{currency}{transport_budget:.0f} total. "
+        f"{pref_instruction}"
+        f"Return ONLY valid JSON: "
+        f'{{"primary_option":{{"mode":"{transport_pref or "flight/train/bus/car"}",'
+        f'"operator":"name","duration":"Xh","price_per_person":0,"total_price":0,'
+        f'"schedule":"times","booking_platform":"platform","fits_budget":true,"budget_note":"note"}},'
+        f'"alternative_options":[{{"mode":"","price_per_person":0,"duration":"","notes":""}}],'
+        f'"local_transport":{{"recommended":"auto","daily_cost":0,"total_local_cost":0,"tips":"tip"}},'
+        f'"total_transport_budget":0,"transport_summary":"summary"}}'
+    )
+
+    human = (
+        f"From:{source} To:{destination}{stopover_note} "
+        f"Travelers:{num_travelers} Days:{num_days} "
+        f"Preference:{transport_pref or 'any'}"
+        f"{route_context}"
+    )
+    raw = _llm_call(system, human)
 
     try:
-        if not raw: raise ValueError("Empty LLM response")
-        prim_data  = _parse_json_robust(raw)
-        price_pp   = _f(prim_data.get("price_per_person", 0))
-        local_cost = _f(prim_data.get("local_daily_cost", 800)) * num_days
-        transport  = {
-            "source": "OpenRouteService + LLM" if route_data else "LLM estimate",
-            "primary_option": {
-                "mode":             prim_data.get("mode", transport_pref or "flight"),
-                "operator":         prim_data.get("operator", "Multiple operators"),
-                "duration":         prim_data.get("duration", "Varies"),
-                "price_per_person": price_pp,
-                "total_price":      _f(prim_data.get("total_price", price_pp * num_travelers)),
-                "schedule":         prim_data.get("schedule", "Check booking platform"),
-                "booking_platform": prim_data.get("booking_platform", "MakeMyTrip"),
-                "fits_budget":      prim_data.get("fits_budget", True),
-            },
-            "local_transport": {
-                "recommended":      prim_data.get("local_transport_mode", "Metro/Taxi"),
-                "daily_cost":       _f(prim_data.get("local_daily_cost", 800)),
-                "total_local_cost": local_cost,
-                "tips":             "Use metro for short distances, taxi for comfort",
-            },
-            "total_transport_budget": _f(prim_data.get("total_price", price_pp * num_travelers)) + local_cost,
-            "transport_summary": f"{prim_data.get('mode','Flight')} from {source} to {destination}",
-        }
-        if route_data: transport["live_route"] = route_data
-        try:
-            alt_data = _parse_json_robust(raw2)
-            transport["alternative_options"] = alt_data.get("alternatives", [])
-        except Exception:
-            transport["alternative_options"] = []
-        logger.info("[TransportAgent] %s %s%d/person ✓", transport["primary_option"]["mode"], currency, int(price_pp))
-    except Exception as e:
-        logger.warning("[TransportAgent] Parse failed: %s — using route-data fallback", e)
+        transport = _parse_json_robust(raw)
+        transport["source"] = "OpenRouteService + LLM" if route_data else "LLM estimate"
         if route_data:
-            dist  = route_data.get("distance_km", 500)
-            mode  = transport_pref or ("flight" if dist > 700 else "train" if dist > 200 else "bus")
-            price_map = {"flight": int(transport_bgt/num_travelers*0.65),
-                         "train":  int(transport_bgt/num_travelers*0.15),
-                         "bus":    int(transport_bgt/num_travelers*0.08),
-                         "car":    int(transport_bgt/num_travelers*0.25)}
-            price_pp  = price_map.get(mode, int(transport_bgt/num_travelers*0.5))
-        else:
-            mode     = transport_pref or "flight"
-            price_pp = int(transport_bgt/num_travelers*0.6)
-
-        local_daily = 800 if currency=="INR" else 25
+            transport["live_route"] = route_data
+        # Enforce preference if LLM ignored it
+        if transport_pref and transport.get("primary_option", {}).get("mode", "") != transport_pref:
+            logger.warning("[TransportAgent] LLM ignored transport_pref=%s — correcting", transport_pref)
+            if "primary_option" in transport:
+                transport["primary_option"]["mode"] = transport_pref
+    except Exception:
         transport = {
-            "transport_summary":    f"{mode.title()} from {source} to {destination}",
-            "total_transport_budget": price_pp*num_travelers + local_daily*num_days,
-            "source":               "Route calculation fallback",
-            "primary_option": {
-                "mode": mode, "operator": "Multiple operators",
-                "duration": "Varies by schedule",
-                "price_per_person": price_pp, "total_price": price_pp*num_travelers,
-                "schedule": "Check booking platform for schedules",
-                "booking_platform": "MakeMyTrip / Booking.com",
-                "fits_budget": price_pp*num_travelers <= transport_bgt,
-            },
-            "alternative_options": [],
-            "local_transport": {
-                "recommended": "Auto/Taxi", "daily_cost": local_daily,
-                "total_local_cost": local_daily*num_days,
-                "tips": f"Use local auto-rickshaws and taxis in {destination}",
-            },
+            "transport_summary":      raw[:400],
+            "total_transport_budget": transport_budget,
+            "source":                 "LLM estimate",
+            "primary_option":         {"mode": transport_pref or "flight"},
         }
-        if route_data: transport["live_route"] = route_data
+        if route_data:
+            transport["live_route"] = route_data
 
     return {"transport_data": transport, "current_agent": "transport_agent"}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 5. HOTEL AGENT
+# 5. HOTEL AGENT  (+ Tool Guardrail)
 # ═════════════════════════════════════════════════════════════════════════════
 
+@traceable(name="HotelAgent", run_type="chain")
 def hotel_agent(state: TripState) -> Dict[str, Any]:
+    """Live prices from Xotelo → 3-tier LLM recommendation within 40% budget."""
     logger.info("[HotelAgent] Finding accommodation…")
-    prefs         = state.get("trip_preferences", {})
-    destination   = prefs.get("destination","")
-    hotel_pref    = prefs.get("hotel_preference","hotel")
-    travel_type   = prefs.get("travel_type") or "general"
-    num_days      = int(prefs.get("num_days") or 5)
-    total_budget  = _f(prefs.get("budget",0))
-    currency      = prefs.get("currency","INR")
-    num_travelers = int(prefs.get("travelers") or 2)
-    start_date    = prefs.get("start_date","")
-    end_date      = prefs.get("end_date","")
-    hotel_bgt     = total_budget * 0.40
-    max_ppn       = hotel_bgt / max(num_days,1)
 
-    if start_date and not end_date and num_days:
-        try:
-            from datetime import datetime as _dth, timedelta as _tdh
-            end_date = (_dth.strptime(start_date, "%Y-%m-%d") + _tdh(days=int(num_days))).strftime("%Y-%m-%d")
-        except Exception:
-            pass
+    prefs              = state.get("trip_preferences", {})
+    memory             = state.get("memory_context", {})
+    destination        = prefs.get("destination", "")
+    hotel_pref         = prefs.get("hotel_preference", "hotel")
+    num_days           = prefs.get("num_days", 5)
+    total_budget       = _f(prefs.get("budget", 0))
+    currency           = prefs.get("currency", "INR")
+    num_travelers      = prefs.get("travelers", 2)
+    start_date         = prefs.get("start_date", "")
+    end_date           = prefs.get("end_date", "")
+    hotel_budget_total = total_budget * 0.40
+    max_per_night      = hotel_budget_total / max(num_days, 1)
 
-    live_context = ""
+    live_hotels_context = ""
     if LIVE_APIS_AVAILABLE and start_date and end_date:
-        try:
-            if _tool_allowed("fetch_hotel_prices",{"destination":destination}):
-                live_hotels = fetch_hotel_prices(destination, start_date, end_date, limit=5)
+        params = {"destination": destination, "limit": 8}
+        if _tool_allowed("fetch_hotel_prices", params):
+            try:
+                live_hotels = fetch_hotel_prices(destination, start_date, end_date, limit=8)
                 if live_hotels:
                     rate = 83.0 if currency == "INR" else 1.0
-                    live_context = "\nLIVE PRICES (Xotelo):\n"
-                    for h in live_hotels[:4]:
-                        live_context += f"  - {h['name']}: {currency}{h['best_price']*rate:.0f}/night\n"
-        except Exception as e:
-            logger.warning("[HotelAgent] Xotelo failed: %s", e)
+                    live_hotels_context = "\nLIVE HOTEL PRICES (Xotelo):\n"
+                    for h in live_hotels[:5]:
+                        price_local = h["best_price"] * rate
+                        live_hotels_context += f"  - {h['name']}: {currency}{price_local:.0f}/night\n"
+                    logger.info("[HotelAgent] ✅ Live prices from Xotelo")
+            except Exception as e:
+                logger.warning("[HotelAgent] Xotelo failed: %s", e)
 
-    hotel_options = []
-    tiers = [
-        ("Budget Pick",    "3*", int(max_ppn * 0.55), ["wifi","ac"]),
-        ("Best Value",     "4*", int(max_ppn * 0.75), ["wifi","ac","breakfast","gym"]),
-        ("Comfort Choice", "5*", int(max_ppn * 0.95), ["wifi","ac","pool","spa","breakfast","concierge"]),
-    ]
+    hotel_docs = memory.get("categorised", {}).get("hotels", [])
+    context    = "\n".join(hotel_docs[:2]) if hotel_docs else ""
 
-    for tier_name, stars, ppn, amenities in tiers:
-        sys_h = (
-            f"Suggest ONE real {stars} hotel in {destination} under {currency}{ppn}/night for {travel_type}."
-            f" Return ONLY minified JSON:"
-            f' {{"name":"actual hotel name","location":"specific area","price_per_night":{ppn},"rating":4.0,"why_pick":"one reason","booking_url":"booking.com"}}'
-        )
-        human_h = f"{destination} {stars} hotel under {currency}{ppn}/night for {num_travelers} people {num_days} nights.{live_context}"
-        raw_h   = _llm_call(sys_h, human_h)
-        try:
-            if not raw_h: raise ValueError("Empty response")
-            h          = _parse_json_robust(raw_h)
-            ppn_actual = _f(h.get("price_per_night", ppn))
-            hotel_options.append({
-                "tier":            tier_name,
-                "name":            h.get("name", f"{stars} Hotel {destination}"),
-                "category":        stars,
-                "location":        h.get("location", destination),
-                "price_per_night": ppn_actual,
-                "total_cost":      ppn_actual * num_days,
-                "amenities":       amenities,
-                "rating":          _f(h.get("rating", 4.0)),
-                "booking_platform": h.get("booking_url", "Booking.com"),
-                "why_pick":        h.get("why_pick", f"Good {stars} option in {destination}"),
-            })
-            logger.info("[HotelAgent] %s: %s @ %s%d/night", tier_name, h.get("name",""), currency, ppn_actual)
-        except Exception as e:
-            logger.warning("[HotelAgent] %s parse failed: %s", tier_name, e)
-            hotel_options.append({
-                "tier": tier_name, "name": f"{tier_name} Hotel in {destination}",
-                "category": stars, "location": destination,
-                "price_per_night": ppn, "total_cost": ppn * num_days,
-                "amenities": amenities, "rating": 3.5 + [t[0] for t in tiers].index(tier_name) * 0.3,
-                "booking_platform": "Booking.com",
-                "why_pick": f"Affordable {stars} accommodation in {destination}",
-            })
+    system = (
+        f"You are a hotel expert. Max per night={currency}{max_per_night:.0f}. "
+        f"ALL 3 options price_per_night<={max_per_night:.0f}. "
+        f"Use real names from live data if provided. Return ONLY valid JSON: "
+        f'{{"hotel_options":['
+        f'{{"tier":"Budget Pick","name":"...","category":"2★","location":"area",'
+        f'"price_per_night":0,"total_cost":0,"amenities":["wifi"],"rating":3.5,'
+        f'"booking_platform":"Booking.com","why_pick":"..."}},'
+        f'{{"tier":"Best Value",...same fields...}},'
+        f'{{"tier":"Comfort Choice",...same fields...}}'
+        f'],"recommended_index":1,"total_accommodation_cost":0,'
+        f'"hotel_tips":"...","within_budget":true}}'
+    )
 
-    rec_idx         = 1
-    recommended     = hotel_options[rec_idx] if len(hotel_options) > 1 else (hotel_options[0] if hotel_options else {"name": f"Hotel in {destination}", "price_per_night": max_ppn * 0.7})
-    total_stay_cost = recommended.get("price_per_night", max_ppn * 0.7) * num_days
+    human = (
+        f"Destination:{destination} Type:{hotel_pref} "
+        f"Nights:{num_days} Travelers:{num_travelers} "
+        f"Budget cap:{currency}{max_per_night:.0f}/night"
+        f"{live_hotels_context}"
+    )
+    raw = _llm_call(system, human)
 
-    hotel = {
-        "hotel_options":            hotel_options,
-        "recommended_index":        rec_idx,
-        "recommended_hotel":        recommended,
-        "total_accommodation_cost": total_stay_cost,
-        "hotel_tips":               f"Book 30+ days in advance for {destination}. Weekdays are cheaper.",
-        "within_budget":            total_stay_cost <= hotel_bgt,
-        "source":                   "Xotelo + LLM" if live_context else "LLM estimate",
-    }
-    logger.info("[HotelAgent] %d options generated, recommended: %s", len(hotel_options), recommended.get("name",""))
+    try:
+        hotel = _parse_json_robust(raw)
+        opts  = hotel.get("hotel_options", [])
+        idx   = min(hotel.get("recommended_index", 1), max(len(opts) - 1, 0))
+        if opts:
+            hotel["recommended_hotel"] = opts[idx]
+            hotel["alternatives"]      = [o for i, o in enumerate(opts) if i != idx]
+        hotel["source"] = "Xotelo + LLM" if live_hotels_context else "LLM estimate"
+    except Exception as e:
+        logger.warning("Hotel JSON parse failed: %s", e)
+        hotel = {
+            "hotel_tips":               raw[:400],
+            "within_budget":            True,
+            "total_accommodation_cost": hotel_budget_total,
+            "hotel_options":            [],
+            "source":                   "LLM estimate",
+        }
+
     return {"hotel_data": hotel, "current_agent": "hotel_agent"}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 6. PLACES AGENT
+# 6. PLACES AGENT  (+ Tool Guardrail, better fallback handling)
 # ═════════════════════════════════════════════════════════════════════════════
 
+@traceable(name="PlacesAgent", run_type="chain")
 def places_agent(state: TripState) -> Dict[str, Any]:
+    """
+    Live places from Geoapify → LLM enrichment.
+    If LLM returns fewer places than Geoapify gave, falls back to raw Geoapify data.
+    """
     logger.info("[PlacesAgent] Discovering places…")
+
     prefs       = state.get("trip_preferences", {})
     weather     = state.get("weather_data", {})
-    destination = prefs.get("destination","")
-    interests   = prefs.get("interests",[])
-    food_pref   = prefs.get("food_preference","any")
-    travel_type = prefs.get("travel_type") or "general"
-    currency    = prefs.get("currency","INR")
+    destination = prefs.get("destination", "")
+    interests   = prefs.get("interests", [])
+    food_pref   = prefs.get("food_preference", "any")
+    travel_type = prefs.get("travel_type", "couple")
     outdoor_ok  = weather.get("outdoor_suitable", True)
-    beach_ok    = weather.get("beach_suitable", False)
+    beach_ok    = weather.get("beach_suitable", True)
 
     live_places = None
-    if LIVE_APIS_AVAILABLE and destination:
-        try:
-            if _tool_allowed("fetch_places",{"destination":destination}):
-                live_places = fetch_places(destination, interests, radius_m=20000, limit=20)
-                if live_places:
-                    logger.info("[PlacesAgent] ✅ Geoapify: %s", live_places.get("places_summary",""))
-        except Exception as e:
-            logger.warning("[PlacesAgent] Geoapify failed: %s", e)
 
+    if LIVE_APIS_AVAILABLE:
+        params = {"destination": destination, "radius_m": 20000, "limit": 25}
+        if _tool_allowed("fetch_places", params):
+            live_places = fetch_places(destination, interests, radius_m=20000, limit=25)
+            if live_places:
+                logger.info("[PlacesAgent] ✅ Geoapify: %s", live_places.get("places_summary",""))
+
+    # Build LLM enrichment context — CAPPED to prevent token truncation
+    live_context = ""
     if live_places:
-        seen_names = set()
-        unique_att = []
-        for a in live_places.get("top_attractions", []):
-            name = a.get("name","").strip()
-            if name and name not in seen_names:
-                seen_names.add(name); unique_att.append(a)
-        live_places["top_attractions"] = unique_att
-        logger.info("[PlacesAgent] After dedup: %d unique attractions", len(unique_att))
+        att_names  = [a["name"] for a in live_places.get("top_attractions", [])[:5]]
+        rest_names = [r["name"] for r in live_places.get("restaurants", [])[:4]]
+        act_names  = [a["name"] for a in live_places.get("activities", [])[:3]]
+        live_context = (
+            f"Real places from Geoapify:\n"
+            f"Attractions:{att_names}\nRestaurants:{rest_names}\nActivities:{act_names}"
+        )
 
-    att_names  = [a.get("name","") for a in (live_places or {}).get("top_attractions",[])[:5] if a.get("name")]
-    rest_names = [r.get("name","") for r in (live_places or {}).get("restaurants",[])[:6] if r.get("name")]
-    rate_note  = currency
+    memory      = state.get("memory_context", {})
+    cats        = memory.get("categorised", {})
+    llm_context = " ".join(cats.get("destination_overview", [])[:1])[:200]
 
-    sys_att = (
-        f"List 5 top attractions in {destination} for {travel_type} trip. All prices in {rate_note}."
-        f' Return ONLY minified JSON: {{"attractions":[{{"name":"place","type":"heritage/beach/cultural","duration":"2h","entry_fee":500,"best_time":"morning","rating":4.5,"location":"area","tip":"insider tip"}}]}}'
+    system = """You are a destination expert. Enrich the real place names with costs, tips, durations.
+Return ONLY valid JSON (no markdown):
+{"top_attractions":[{"name":"exact name","type":"heritage/beach/adventure","duration":"2h","entry_fee":null,"best_time":"morning","rating":4.2,"location":"area"}],"restaurants":[{"name":"exact name","cuisine":"local","avg_cost_per_person":0,"must_try_dish":"dish","location":"area","rating":4.0}],"activities":[{"name":"activity","type":"adventure","cost_per_person":0,"duration":"2h","suitable_for":"couple"}],"hidden_gems":["tip"],"places_summary":"overview"}"""
+
+    human = (
+        f"Destination:{destination} Type:{travel_type} "
+        f"Interests:{interests[:3]} Food:{food_pref} "
+        f"Outdoor:{outdoor_ok} Beach:{beach_ok}\n"
+        f"{live_context or llm_context}"
     )
-    raw_att = _llm_call(sys_att, f"Known places: {att_names}. Give 5 DIFFERENT specific places with real {rate_note} entry fees.")
+    raw = _llm_call(system, human)
 
-    sys_rest = (
-        f"List 5 restaurants in {destination} for {travel_type}. All prices in {rate_note}."
-        f' Return ONLY minified JSON: {{"restaurants":[{{"name":"restaurant","cuisine":"type","avg_cost_per_person":1500,"must_try_dish":"dish","location":"area","rating":4.2}}]}}'
-    )
-    raw_rest = _llm_call(sys_rest, f"Known restaurants: {rest_names}. Give 5 restaurants with REAL {rate_note} prices per person.")
+    try:
+        enriched = _parse_json_robust(raw)
 
-    sys_act = (
-        f"List 3 activities in {destination} for {travel_type}. All prices in {rate_note}."
-        f' Return ONLY minified JSON: {{"activities":[{{"name":"activity","type":"adventure/relaxation","cost_per_person":2000,"duration":"3h","suitable_for":"couple","tip":"booking tip"}}]}}'
-    )
-    raw_act = _llm_call(sys_act, f"{destination} {travel_type} activities. Real {rate_note} prices.")
+        # If LLM returned fewer attractions than Geoapify gave — use Geoapify's raw list
+        if live_places:
+            geoapify_att_count = len(live_places.get("top_attractions", []))
+            enriched_att_count = len(enriched.get("top_attractions", []))
+            if enriched_att_count < min(geoapify_att_count, 3):
+                logger.info(
+                    "[PlacesAgent] LLM returned %d attractions vs Geoapify's %d — using Geoapify list",
+                    enriched_att_count, geoapify_att_count
+                )
+                enriched["top_attractions"] = live_places["top_attractions"]
 
-    def _safe_list(raw, key):
-        try:
-            if not raw: raise ValueError("Empty")
-            d = _parse_json_robust(raw)
-            return [x for x in d.get(key, []) if isinstance(x, dict) and x.get("name")]
-        except Exception:
-            return []
+            geoapify_rest_count = len(live_places.get("restaurants", []))
+            enriched_rest_count = len(enriched.get("restaurants", []))
+            if enriched_rest_count == 0 and geoapify_rest_count > 0:
+                enriched["restaurants"] = live_places["restaurants"]
 
-    attractions = _safe_list(raw_att, "attractions")
-    restaurants = _safe_list(raw_rest, "restaurants")
-    activities  = _safe_list(raw_act,  "activities")
+        enriched["source"] = "Geoapify + LLM" if live_places else "LLM estimate"
 
-    final_attractions = attractions if attractions else (live_places or {}).get("top_attractions", [])
-    final_restaurants = restaurants if restaurants else (live_places or {}).get("restaurants", [])
+    except Exception:
+        enriched = live_places or {
+            "places_summary":  raw[:400],
+            "top_attractions": [],
+            "restaurants":     [],
+            "activities":      [],
+            "source":          "LLM estimate",
+        }
 
-    if not final_attractions:
-        logger.warning("[PlacesAgent] No attractions found — generating stubs for %s", destination)
-        final_attractions = [
-            {"name": f"{destination} Main Attraction",  "type":"sightseeing","duration":"2h","entry_fee":0,"best_time":"morning","rating":4.0,"location":destination,"tip":"Ask locals for the best spots"},
-            {"name": f"{destination} Heritage Site",    "type":"heritage",   "duration":"2h","entry_fee":0,"best_time":"morning","rating":4.0,"location":destination,"tip":"Hire a local guide for context"},
-            {"name": f"{destination} Nature Viewpoint", "type":"nature",     "duration":"1h","entry_fee":0,"best_time":"evening", "rating":4.2,"location":destination,"tip":"Golden hour is the best time"},
-        ]
-    if not final_restaurants:
-        final_restaurants = [
-            {"name":"Local Restaurant","cuisine":"Regional","avg_cost_per_person":300 if currency=="INR" else 15,"must_try_dish":"Regional specialty","location":destination,"rating":4.0},
-            {"name":"Hotel Restaurant","cuisine":"Multi-cuisine","avg_cost_per_person":400 if currency=="INR" else 20,"must_try_dish":"Chef special","location":destination,"rating":3.8},
-        ]
-
-    enriched = {
-        "top_attractions": final_attractions,
-        "restaurants":     final_restaurants,
-        "activities":      activities,
-        "places_summary":  f"Top spots in {destination} for a {travel_type} trip",
-        "source":          "Geoapify + LLM" if live_places else "LLM estimate",
-    }
-    logger.info("[PlacesAgent] Final: %d attractions, %d restaurants, %d activities",
-                len(enriched["top_attractions"]), len(enriched["restaurants"]), len(enriched["activities"]))
     return {"places_data": enriched, "current_agent": "places_agent"}
 
 
@@ -777,285 +839,286 @@ def places_agent(state: TripState) -> Dict[str, Any]:
 # 7. BUDGET AGENT
 # ═════════════════════════════════════════════════════════════════════════════
 
+@traceable(name="BudgetAgent", run_type="chain")
 def budget_agent(state: TripState) -> Dict[str, Any]:
+    """Estimate costs from upstream agent data, produce breakdown."""
     logger.info("[BudgetAgent] Calculating budget…")
+
     prefs         = state.get("trip_preferences", {})
     transport     = state.get("transport_data", {})
     hotel         = state.get("hotel_data", {})
     places        = state.get("places_data", {})
-    total_budget  = _f(prefs.get("budget",0))
-    currency      = prefs.get("currency","INR")
-    num_travelers = int(prefs.get("travelers") or 2)
-    num_days      = int(prefs.get("num_days") or 5)
-    destination   = prefs.get("destination","")
+    total_budget  = _f(prefs.get("budget", 0))
+    currency      = prefs.get("currency", "INR")
+    num_travelers = prefs.get("travelers", 2)
+    num_days      = prefs.get("num_days", 5)
 
-    transport_cost = _f(transport.get("total_transport_budget",0))
+    transport_cost = _f(transport.get("total_transport_budget", 0))
     if transport_cost == 0:
-        prim           = transport.get("primary_option",{})
-        transport_cost = _f(prim.get("total_price",0)) + _f(transport.get("local_transport",{}).get("total_local_cost",0))
+        prim           = transport.get("primary_option", {})
+        transport_cost = _f(prim.get("total_price", 0)) + _f(
+            transport.get("local_transport", {}).get("total_local_cost", 0)
+        )
 
-    hotel_cost = _f(hotel.get("total_accommodation_cost",0))
+    hotel_cost = _f(hotel.get("total_accommodation_cost", 0))
     if hotel_cost == 0:
-        rec        = hotel.get("recommended_hotel",{})
-        hotel_cost = _f(rec.get("total_cost",0) or _f(rec.get("price_per_night",0))*num_days)
+        rec        = hotel.get("recommended_hotel", {})
+        hotel_cost = _f(rec.get("total_cost", 0) or _f(rec.get("price_per_night", 0)) * num_days)
 
-    activity_cost = sum(_f(a.get("cost_per_person",0))*num_travelers for a in places.get("activities",[])[:4])
-    for att in places.get("top_attractions",[])[:5]:
-        if att.get("entry_fee"): activity_cost += _f(att["entry_fee"])*num_travelers
+    activity_cost = sum(
+        _f(a.get("cost_per_person", 0)) * num_travelers
+        for a in places.get("activities", [])[:4]
+    )
+    for att in places.get("top_attractions", [])[:5]:
+        if att.get("entry_fee"):
+            activity_cost += _f(att["entry_fee"]) * num_travelers
 
-    daily_food  = max(300, min(1500, total_budget*0.008)) if currency=="INR" else max(15, min(100, total_budget*0.008))
-    food_cost   = daily_food * num_days * num_travelers
-    misc_cost   = total_budget * 0.06
-    estimated   = transport_cost + hotel_cost + activity_cost + food_cost + misc_cost
-    surplus     = total_budget - estimated
+    daily_food    = max(300, min(1200, total_budget * 0.008)) if currency == "INR" else max(15, min(80, total_budget * 0.008))
+    food_cost     = daily_food * num_days * num_travelers
+    misc_cost     = total_budget * 0.06
+    estimated     = transport_cost + hotel_cost + activity_cost + food_cost + misc_cost
+    surplus       = total_budget - estimated
 
-    logger.info("[BudgetAgent] transport=%d hotel=%d food=%d activities=%d total=%d",
-                transport_cost, hotel_cost, food_cost, activity_cost, estimated)
+    system = """Return ONLY valid JSON budget report:
+{"breakdown":{"transport":0,"accommodation":0,"food":0,"activities":0,"miscellaneous":0,"estimated_total":0},"budget_provided":0,"surplus_or_deficit":0,"within_budget":true,"budget_status":"on_track","optimization_tips":["tip1","tip2"],"daily_budget":0,"budget_summary":"summary"}"""
 
-    budget_result = {
-        "budget_summary":    f"Estimated {currency}{estimated:,.0f} of {currency}{total_budget:,.0f} total budget",
-        "within_budget":     surplus >= 0,
-        "budget_status":     "on_track" if surplus >= 0 else "over_budget",
-        "breakdown": {
-            "transport":      round(transport_cost),
-            "accommodation":  round(hotel_cost),
-            "food":           round(food_cost),
-            "activities":     round(activity_cost),
-            "miscellaneous":  round(misc_cost),
-            "estimated_total":round(estimated),
-        },
-        "surplus_or_deficit": round(surplus),
-        "budget_provided":    total_budget,
-        "daily_budget":       round(estimated / max(num_days,1)),
-        "optimization_tips": [
-            f"Book flights to {destination} at least 60 days in advance to save 20-30%",
-            f"Use public transport — saves approx {currency}{int(daily_food*0.4)}/day vs taxis",
-            "Visit free attractions early in the trip to offset paid activity costs",
-        ],
-    }
+    human = (
+        f"Budget:{currency}{total_budget} Transport:{currency}{transport_cost:.0f} "
+        f"Hotel:{currency}{hotel_cost:.0f} Food:{currency}{food_cost:.0f} "
+        f"Activities:{currency}{activity_cost:.0f} Misc:{currency}{misc_cost:.0f} "
+        f"Total:{currency}{estimated:.0f} Surplus:{currency}{surplus:.0f}"
+    )
+    raw = _llm_call(system, human)
+
+    try:
+        budget_result = _parse_json_robust(raw)
+    except Exception:
+        budget_result = {
+            "budget_summary":  raw[:300],
+            "within_budget":   surplus >= 0,
+            "budget_status":   "on_track" if surplus >= 0 else "over_budget",
+            "breakdown": {
+                "transport":       transport_cost, "accommodation": hotel_cost,
+                "food":            food_cost,      "activities":    activity_cost,
+                "miscellaneous":   misc_cost,      "estimated_total": estimated,
+            },
+            "surplus_or_deficit": surplus,
+            "budget_provided":    total_budget,
+        }
+
     return {"budget_summary": budget_result, "current_agent": "budget_agent"}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 8. ITINERARY AGENT — LLM activity bank, unique per day, any destination
+# 8. ITINERARY AGENT  (compact prompt + 8000-token LLM + output guard)
 # ═════════════════════════════════════════════════════════════════════════════
 
+@traceable(name="ItineraryAgent", run_type="chain",
+           metadata={"max_tokens": 8000, "critical": True})
 def itinerary_agent(state: TripState) -> Dict[str, Any]:
+    """
+    Build complete day-wise itinerary.
+    Uses dedicated high-token LLM + compact prompt to prevent JSON truncation.
+    Supports multi-stop routes via stopovers field.
+    """
     logger.info("[ItineraryAgent] Building itinerary…")
-    prefs       = state.get("trip_preferences", {})
-    weather     = state.get("weather_data", {})
-    transport   = state.get("transport_data", {})
-    hotel       = state.get("hotel_data", {})
-    places      = state.get("places_data", {})
-    budget      = state.get("budget_summary", {})
 
-    num_days       = int(prefs.get("num_days") or 5)
-    destination    = prefs.get("destination", "")
-    source         = prefs.get("source", "")
-    travel_type    = prefs.get("travel_type") or "general"
-    currency       = prefs.get("currency", "INR")
-    transport_mode = transport.get("primary_option", {}).get("mode", "flight")
+    prefs     = state.get("trip_preferences", {})
+    weather   = state.get("weather_data", {})
+    transport = state.get("transport_data", {})
+    hotel     = state.get("hotel_data", {})
+    places    = state.get("places_data", {})
+    budget    = state.get("budget_summary", {})
+
+    num_days    = prefs.get("num_days", 5)
+    destination = prefs.get("destination", "")
+    source      = prefs.get("source", "")
+    travel_type = prefs.get("travel_type", "couple")
+    currency    = prefs.get("currency", "INR")
+    stopovers   = prefs.get("stopovers", [])
+
+    selected_hotels = prefs.get("selected_hotels", {})
+    if selected_hotels:
+        hotel_name = " | ".join(f"{loc}:{name}" for loc, name in selected_hotels.items())
+    else:
+        hotel_name = hotel.get("recommended_hotel", {}).get("name", "hotel")
+
+    transport_mode = transport.get("primary_option", {}).get("mode", "car")
     daily_budget   = budget.get("daily_budget", 0)
     conditions     = weather.get("conditions", "pleasant")
-    hotel_name     = hotel.get("recommended_hotel", {}).get("name") or f"Hotel in {destination}"
-    if hotel_name in ("the hotel", "Hotel in "):
-        hotel_name = f"Hotel in {destination}"
 
-    all_attractions = [a.get("name","") for a in places.get("top_attractions",[])[:12] if a.get("name")]
-    all_restaurants = [r.get("name","") for r in places.get("restaurants",[])[:8] if r.get("name")]
-    all_activities  = [a.get("name","") for a in places.get("activities",[])[:6] if a.get("name")]
+    # Minimal attraction list to save tokens
+    attractions = [a.get("name","") for a in places.get("top_attractions", [])[:3]]
+    restaurants = [r.get("name","") for r in places.get("restaurants", [])[:2]]
 
-    # Step 1: LLM generates activity bank for this destination
-    count = min(num_days * 3, 15)
-    system_bank = (
-        f"You are a {destination} travel expert. "
-        f"List {count} unique, specific things to do in {destination} for a {travel_type} trip. "
-        f"Each must be a specific named place or experience. Mix landmarks, hidden gems, food, culture, outdoors. "
-        f'Return ONLY minified JSON: {{"activities":["activity 1","activity 2",...]}}'
+    hotel_note = ""
+    if selected_hotels:
+        hotel_note = " HOTELS:" + ",".join(f"{l}={n}" for l, n in selected_hotels.items())
+
+    # Multi-stop route context
+    route_note = ""
+    if stopovers:
+        all_stops = [source] + stopovers + [destination]
+        route_note = f" ROUTE:{' → '.join(s for s in all_stops if s)}"
+
+    system = (
+        f"You are an expert travel planner. Create a COMPLETE {num_days}-day itinerary.\n"
+        f"RULES:\n"
+        f"1. Output ALL {num_days} days — do NOT stop early\n"
+        f"2. Use COMPACT JSON — no pretty-printing, no extra whitespace\n"
+        f"3. Hotel every day: {hotel_name}\n"
+        f"4. Transport mode: {transport_mode}\n"
+        f"5. Return ONLY this JSON (compact):\n"
+        f'{{"trip_title":"...","days":['
+        f'{{"day":1,"date_label":"Day 1","theme":"...",'
+        f'"morning":{{"activity":"...","duration":"2h","location":"..."}},'
+        f'"afternoon":{{"activity":"...","duration":"3h","location":"..."}},'
+        f'"evening":{{"activity":"...","duration":"2h","location":"..."}},'
+        f'"night":{{"activity":"...","location":"..."}},'
+        f'"meals":{{"breakfast":"...","lunch":"...","dinner":"..."}},'
+        f'"accommodation":"{hotel_name}",'
+        f'"daily_highlights":["..."],"estimated_day_cost":0}}],'
+        f'"packing_checklist":["item1","item2"],'
+        f'"emergency_contacts":{{"police":"100","ambulance":"108","tourist_helpline":"1363"}},'
+        f'"travel_tips":["tip1","tip2"]}}'
+        f"{hotel_note}"
     )
-    dest_bank = []
-    try:
-        raw_bank  = _llm_call(system_bank, f"Destination:{destination} Style:{travel_type} Weather:{conditions}. Give {count} completely different specific activities.")
-        if raw_bank:
-            bank_data = _parse_json_robust(raw_bank)
-            dest_bank = [a for a in bank_data.get("activities", []) if isinstance(a, str) and len(a) > 3]
-            logger.info("[ItineraryAgent] Activity bank: %d activities for %s", len(dest_bank), destination)
-    except Exception as e:
-        logger.warning("[ItineraryAgent] Activity bank failed: %s — using Geoapify only", e)
 
-    activity_pool = []
-    for item in (dest_bank + all_attractions + all_activities):
-        if item and item not in activity_pool:
-            activity_pool.append(item)
-    logger.info("[ItineraryAgent] Total activity pool: %d items", len(activity_pool))
-
-    # Step 2: Generate each day
-    used_activities: List[str] = []
-    days: List[Dict] = []
-
-    for day_num in range(1, num_days + 1):
-        available = [a for a in activity_pool if a not in used_activities]
-        day_picks = available[:3] if len(available) >= 3 else (available + [f"Free exploration in {destination}"])
-        used_activities.extend(day_picks[:2])
-
-        rest_idx    = (day_num - 1) % max(len(all_restaurants), 1)
-        dinner_rest = all_restaurants[rest_idx] if all_restaurants else f"local {destination} restaurant"
-
-        is_first = day_num == 1
-        is_last  = day_num == num_days
-
-        system = (
-            f"Output ONLY minified JSON. No spaces. Max 450 tokens."
-            f' Format: {{"day":{day_num},"theme":"unique theme for this day",'
-            f'"morning":{{"activity":"specific place","location":"area","tip":"insider tip"}},'
-            f'"afternoon":{{"activity":"specific place","location":"area","tip":"insider tip"}},'
-            f'"evening":{{"activity":"specific place","location":"area","tip":"insider tip"}},'
-            f'"night":{{"activity":"activity","location":"area"}},'
-            f'"meals":{{"breakfast":"place","lunch":"place","dinner":"{dinner_rest}"}},'
-            f'"accommodation":"{hotel_name}","estimated_day_cost":0}}'
-        )
-
-        travel_note = f"Day 1: arrive from {source} by {transport_mode}. Check in first. " if is_first and source else ""
-        depart_note = f"Last day: morning activity then checkout and airport. " if is_last else ""
-        human = (
-            f"{travel_note}{depart_note}"
-            f"Day {day_num}/{num_days} in {destination}. {travel_type} trip. "
-            f"MUST USE these specific places (different from all other days): {day_picks}. "
-            f"Weather:{conditions} {weather.get('avg_temp_day','28C')}. Add insider tips."
-        )
-
-        raw = _llm_call(system, human)
-
-        try:
-            if not raw: raise ValueError("Empty response")
-            day_obj = _parse_json_robust(raw)
-            if not isinstance(day_obj, dict): raise ValueError("Not a dict")
-            day_obj["day"] = day_num
-            days.append(day_obj)
-            logger.info("[ItineraryAgent] Day %d/%d: %s ✓", day_num, num_days, day_obj.get("theme",""))
-        except Exception as e:
-            logger.warning("[ItineraryAgent] Day %d parse failed: %s — using structured fallback", day_num, e)
-            themes = ["Arrival & Exploration","Sightseeing & Culture","Nature & Adventure",
-                      "Local Experiences","Relaxation & Shopping","Hidden Gems","Farewell Day"]
-            theme  = themes[(day_num-1) % len(themes)]
-            if is_first: theme = "Arrival & First Impressions"
-            if is_last:  theme = "Farewell & Departure"
-            days.append({
-                "day": day_num, "theme": theme,
-                "morning":   {"activity": day_picks[0] if day_picks else f"Explore {destination}", "location": destination, "tip": "Start early to beat the crowds"},
-                "afternoon": {"activity": day_picks[1] if len(day_picks)>1 else f"Discover local attractions", "location": destination, "tip": "Take a break and try a local cafe"},
-                "evening":   {"activity": day_picks[2] if len(day_picks)>2 else f"Sunset views in {destination}", "location": destination, "tip": "Golden hour offers the best photography light"},
-                "night":     {"activity": f"Dinner at {dinner_rest}", "location": destination},
-                "meals":     {"breakfast": f"Breakfast at {hotel_name}", "lunch": "Local restaurant", "dinner": dinner_rest},
-                "accommodation": hotel_name,
-                "estimated_day_cost": int(daily_budget) if daily_budget else 2000,
-            })
-
-    # Step 3: Trip meta
-    system2 = (
-        f'Output minified JSON: {{"trip_title":"catchy title for {destination} {travel_type} trip",'
-        f'"packing_checklist":["item1","item2","item3","item4","item5"],'
-        f'"travel_tips":["specific tip1","tip2","tip3"],'
-        f'"emergency_contacts":{{"police":"local number","ambulance":"local number","tourist_helpline":"local number"}}}}'
+    human = (
+        f"Route:{source}→{destination}{route_note} "
+        f"Days:{num_days} Type:{travel_type} "
+        f"Transport:{transport_mode} Budget:{currency}{daily_budget}/day "
+        f"Weather:{conditions} Attractions:{attractions} Restaurants:{restaurants}"
     )
-    raw2 = _llm_call(system2, f"{num_days}-day {destination} {travel_type} trip. {conditions} weather.")
+
+    logger.info("[ItineraryAgent] Calling LLM (max_tokens=8000) for %d-day itinerary", num_days)
+    raw = _llm_call_high_tokens(system, human, max_tokens=8000)
+
     try:
-        if not raw2: raise ValueError("Empty")
-        meta = _parse_json_robust(raw2)
-    except Exception:
-        meta = {
-            "trip_title":        f"{num_days}-Day {destination} Trip",
-            "packing_checklist": ["Passport & visa","Sunscreen SPF50+","Light breathable clothing","Comfortable walking shoes","Power bank & adaptor"],
-            "travel_tips":       [f"Visit popular {destination} attractions early morning", "Book activities 2 days in advance", "Keep copies of all documents"],
-            "emergency_contacts":{"police":"100","ambulance":"108","tourist_helpline":"1363"},
+        itinerary  = _parse_json_robust(raw)
+        days_count = len(itinerary.get("days", []))
+        logger.info("[ItineraryAgent] Parsed %d days ✓", days_count)
+    except Exception as parse_err:
+        logger.error("[ItineraryAgent] Parse failed: %s | Raw[:400]: %s", parse_err, raw[:400])
+        itinerary = {
+            "trip_title":        f"{num_days}-Day Trip",
+            "days":              [],
+            "raw_plan":          raw[:1000],
+            "packing_checklist": [],
+            "emergency_contacts":{},
+            "travel_tips":       [],
         }
 
-    itinerary = {
-        "trip_title":        meta.get("trip_title", f"{num_days}-Day {destination} Trip"),
-        "days":              days,
-        "packing_checklist": meta.get("packing_checklist", []),
-        "travel_tips":       meta.get("travel_tips", []),
-        "emergency_contacts":meta.get("emergency_contacts", {}),
-    }
-    logger.info("[ItineraryAgent] Complete — %d/%d days generated", len(days), num_days)
-
-    # Step 4: Attach weather
-    daily_lookup   = weather.get("daily_lookup", {})
+    # ── Attach daily weather forecast to each itinerary day ─────────────────────
+    weather_data   = state.get("weather_data", {})
+    daily_lookup   = weather_data.get("daily_lookup", {})
     start_date_str = prefs.get("start_date", "")
+
     if itinerary.get("days"):
         if daily_lookup and start_date_str:
             try:
                 from datetime import datetime as _dt2, timedelta as _td2
                 start_dt = _dt2.strptime(start_date_str, "%Y-%m-%d")
                 for i, day in enumerate(itinerary["days"]):
-                    day_date          = (start_dt + _td2(days=i)).strftime("%Y-%m-%d")
-                    day["date"]       = day_date
+                    day_date = (start_dt + _td2(days=i)).strftime("%Y-%m-%d")
+                    day["date"] = day_date
                     day["date_label"] = (start_dt + _td2(days=i)).strftime("%d %b")
-                    day["weather"]    = daily_lookup.get(day_date, {
-                        "max_temp": weather.get("avg_temp_day","N/A"),
-                        "min_temp": weather.get("avg_temp_night","N/A"),
-                        "conditions": conditions, "emoji": "🌤️",
-                    })
+                    if day_date in daily_lookup:
+                        day["weather"] = daily_lookup[day_date]
+                    else:
+                        # Beyond 16-day forecast window — use trip average
+                        day["weather"] = {
+                            "max_temp":      weather_data.get("avg_temp_day",   "N/A"),
+                            "min_temp":      weather_data.get("avg_temp_night", "N/A"),
+                            "conditions":    weather_data.get("conditions",     "N/A"),
+                            "precipitation": "N/A",
+                            "emoji":         "🌤️",
+                        }
+                logger.info("[ItineraryAgent] Weather attached to %d days ✓", len(itinerary["days"]))
             except Exception as e:
                 logger.warning("[ItineraryAgent] Weather date matching failed: %s", e)
         else:
-            overall = {"max_temp": weather.get("avg_temp_day","N/A"), "min_temp": weather.get("avg_temp_night","N/A"), "conditions": conditions, "emoji": "🌤️"}
+            # No dates or no forecast — attach overall conditions to every day
+            overall_weather = {
+                "max_temp":      weather_data.get("avg_temp_day",   "N/A"),
+                "min_temp":      weather_data.get("avg_temp_night", "N/A"),
+                "conditions":    weather_data.get("conditions",     "N/A"),
+                "precipitation": "N/A",
+                "emoji":         "🌤️",
+            }
             for day in itinerary["days"]:
-                day.setdefault("weather", overall)
+                day.setdefault("weather", overall_weather)
 
+    # Full output guard — deep scan all string fields for PII
     if GUARDRAILS_AVAILABLE and itinerary.get("days"):
         try:
             itinerary = output_guard_itinerary(itinerary, prefs)
-        except Exception:
-            pass
+            logger.info("[ItineraryAgent] Output guard scan complete ✓")
+        except Exception as og_err:
+            logger.warning("[ItineraryAgent] Output guard failed (non-fatal): %s", og_err)
 
     return {"itinerary": itinerary, "current_agent": "itinerary_agent"}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 9. FINAL REVIEW AGENT
+# 9. FINAL REVIEW AGENT  (+ Hallucination Guard)
 # ═════════════════════════════════════════════════════════════════════════════
 
+@traceable(name="FinalReviewAgent", run_type="chain")
 def final_review_agent(state: TripState) -> Dict[str, Any]:
+    """Validate plan completeness and run hallucination guard."""
     logger.info("[FinalReviewAgent] Validating…")
-    prefs   = state.get("trip_preferences",{})
-    budget  = state.get("budget_summary",{})
-    weather = state.get("weather_data",{})
-    hotel   = state.get("hotel_data",{})
-    itin    = state.get("itinerary",{})
+
+    prefs   = state.get("trip_preferences", {})
+    budget  = state.get("budget_summary", {})
+    weather = state.get("weather_data", {})
+    hotel   = state.get("hotel_data", {})
+    itin    = state.get("itinerary", {})
 
     conflicts, warnings = [], []
+
     if not budget.get("within_budget", True):
-        deficit = abs(_f(budget.get("surplus_or_deficit",0)))
+        deficit = abs(_f(budget.get("surplus_or_deficit", 0)))
         conflicts.append(f"Budget overrun by {prefs.get('currency','INR')}{deficit:.0f}")
     if not hotel.get("within_budget", True):
         conflicts.append("Hotel exceeds budget")
-    for w in weather.get("weather_warnings",[]):
-        if w and len(w) > 3: warnings.append(f"Weather: {w}")
+    for w in weather.get("weather_warnings", []):
+        if w and len(w) > 3:
+            warnings.append(f"Weather: {w}")
 
-    days_planned = len(itin.get("days",[]))
-    num_days     = int(prefs.get("num_days") or 5)
+    days_planned = len(itin.get("days", []))
+    num_days     = prefs.get("num_days", 5)
     if days_planned < num_days:
         warnings.append(f"Itinerary has {days_planned} days, expected {num_days}")
+    if not state.get("transport_data"):
+        conflicts.append("Transport data missing")
 
+    approved = len(conflicts) == 0
+
+    # Hallucination guard
     hallucination_report = {}
     if GUARDRAILS_AVAILABLE:
         try:
             hallucination_report = hallucination_guard(state)
             if not hallucination_report.get("passed", True):
-                for flag in hallucination_report.get("flags",[]):
+                for flag in hallucination_report.get("flags", []):
                     warnings.append(f"🔍 {flag}")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("[FinalReviewAgent] Hallucination guard error: %s", e)
 
-    approved = len(conflicts) == 0
     return {
         "review_status": {
-            "approved": approved,
-            "status":   "approved" if approved else "needs_revision",
-            "conflicts": conflicts, "warnings": warnings,
+            "approved":             approved,
+            "status":               "approved" if approved else "needs_revision",
+            "conflicts":            conflicts,
+            "warnings":             warnings,
             "hallucination_report": hallucination_report,
-            "review_summary": "✅ All checks passed." if approved else f"⚠️ {'; '.join(conflicts)}",
+            "hallucination_score":  hallucination_report.get("score", 1.0),
+            "review_summary": (
+                "✅ All checks passed."
+                if approved
+                else f"⚠️ {len(conflicts)} conflict(s): {'; '.join(conflicts)}"
+            ),
         },
         "current_agent": "final_review_agent",
     }
@@ -1066,56 +1129,92 @@ def final_review_agent(state: TripState) -> Dict[str, Any]:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def memory_update_agent(state: TripState) -> Dict[str, Any]:
-    prefs   = state.get("trip_preferences",{})
-    profile = state.get("user_profile",{})
-    past    = profile.get("past_trips",[])
-    dest    = prefs.get("destination","")
-    if dest and dest not in past: past.append(dest)
-    return {
-        "user_profile": {**profile, "past_trips": past, "last_trip": prefs,
-                         "last_updated": datetime.now().isoformat()},
-        "current_agent": "memory_update_agent",
+    """Save current trip preferences to user profile."""
+    logger.info("[MemoryUpdateAgent] Saving to memory…")
+
+    prefs   = state.get("trip_preferences", {})
+    profile = state.get("user_profile", {})
+
+    past_trips = profile.get("past_trips", [])
+    dest       = prefs.get("destination", "")
+    if dest and dest not in past_trips:
+        past_trips.append(dest)
+
+    updated_profile = {
+        **profile,
+        "past_trips":   past_trips,
+        "last_trip":    prefs,
+        "preferences": {
+            "food":          prefs.get("food_preference"),
+            "accommodation": prefs.get("hotel_preference"),
+            "transport":     prefs.get("transport_preference"),
+        },
+        "last_updated": datetime.now().isoformat(),
     }
+
+    return {"user_profile": updated_profile, "current_agent": "memory_update_agent"}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 11. HOTEL OPTIONS PER LOCATION AGENT
 # ═════════════════════════════════════════════════════════════════════════════
 
+@traceable(name="HotelOptionsAgent", run_type="chain")
 def hotel_options_per_location_agent(state: TripState) -> Dict[str, Any]:
+    """Generate 3 hotel options per unique location in the itinerary."""
     logger.info("[HotelLocationAgent] Generating hotel options per location…")
-    prefs    = state.get("trip_preferences",{})
-    itin     = state.get("itinerary",{})
-    days     = itin.get("days",[])
-    currency = prefs.get("currency","INR")
-    total    = _f(prefs.get("budget",0))
-    num_days = int(prefs.get("num_days") or max(len(days),1))
-    travelers= int(prefs.get("travelers") or 2)
-    max_ppn  = (total*0.40) / max(num_days,1)
+
+    prefs    = state.get("trip_preferences", {})
+    itin     = state.get("itinerary", {})
+    days     = itin.get("days", [])
+    currency = prefs.get("currency", "INR")
+    total    = _f(prefs.get("budget", 0))
+    num_days = prefs.get("num_days", max(len(days), 1))
+    travelers= prefs.get("travelers", 2)
+
+    hotel_budget  = total * 0.40
+    max_per_night = hotel_budget / max(num_days, 1)
 
     locations_seen = []
     for day in days:
-        loc = (day.get("accommodation") or day.get("morning",{}).get("location","") or prefs.get("destination",""))
-        loc = loc.split(",")[0].strip() if loc else prefs.get("destination","")
-        if loc and loc not in locations_seen: locations_seen.append(loc)
-    if not locations_seen:
-        locations_seen = [prefs.get("destination","Destination")]
+        loc = (
+            day.get("accommodation") or
+            day.get("morning", {}).get("location", "") or
+            prefs.get("destination", "")
+        )
+        loc = loc.split(",")[0].strip() if loc else prefs.get("destination", "")
+        if loc and loc not in locations_seen:
+            locations_seen.append(loc)
 
-    options_by_loc = {}
+    if not locations_seen:
+        locations_seen = [prefs.get("destination", "Destination")]
+
+    options_by_loc: Dict[str, List[Dict]] = {}
+
     for loc in locations_seen:
         system = (
-            f"Hotel expert for {loc}. Max {currency}{max_ppn:.0f}/night. 3 real hotels."
-            f' Return ONLY JSON: {{"options":[{{"tier":"Budget","name":"real name","stars":"3*","location":"area","price_per_night":0,"total_for_stay":0,"amenities":["wifi","ac"],"rating":3.5,"book_on":"Booking.com","highlight":"reason"}},{{"tier":"Mid-range","name":"...","stars":"4*","location":"area","price_per_night":0,"total_for_stay":0,"amenities":["wifi","breakfast"],"rating":4.0,"book_on":"MakeMyTrip","highlight":"reason"}},{{"tier":"Premium","name":"...","stars":"5*","location":"area","price_per_night":0,"total_for_stay":0,"amenities":["wifi","pool","spa"],"rating":4.5,"book_on":"Booking.com","highlight":"reason"}}]}}'
+            f"Hotel expert for {loc}. Max {currency}{max_per_night:.0f}/night. "
+            f"3 DIFFERENT real hotels. Return ONLY compact JSON: "
+            f'{{"options":['
+            f'{{"tier":"Budget","name":"real name","stars":"3★","location":"area",'
+            f'"price_per_night":0,"total_for_stay":0,"amenities":["wifi","ac"],'
+            f'"rating":3.5,"book_on":"Booking.com","highlight":"reason"}},'
+            f'{{"tier":"Mid-range",...}},'
+            f'{{"tier":"Premium",...}}'
+            f']}}'
         )
-        raw = _llm_call(system, f"Location:{loc} Nights:{num_days} Travelers:{travelers} Max:{currency}{max_ppn:.0f}/night")
+        human  = f"Location:{loc} Nights:{num_days} Travelers:{travelers} Max:{currency}{max_per_night:.0f}/night"
+        raw    = _llm_call(system, human)
+
         try:
-            if not raw: raise ValueError("Empty")
-            options_by_loc[loc] = _parse_json_robust(raw).get("options",[])
-        except Exception:
+            data = _parse_json_robust(raw)
+            options_by_loc[loc] = data.get("options", [])
+        except Exception as e:
+            logger.warning("Hotel options parse failed for %s: %s", loc, e)
             options_by_loc[loc] = [
-                {"tier":"Budget",    "name":f"Budget Hotel {loc}",  "stars":"3*", "location":loc, "price_per_night":max_ppn*0.5,  "amenities":["wifi"],"rating":3.5,"book_on":"Booking.com","highlight":"Affordable"},
-                {"tier":"Mid-range", "name":f"Comfort Inn {loc}",   "stars":"4*", "location":loc, "price_per_night":max_ppn*0.75, "amenities":["wifi","breakfast"],"rating":4.0,"book_on":"MakeMyTrip","highlight":"Good value"},
-                {"tier":"Premium",   "name":f"Grand Hotel {loc}",   "stars":"5*", "location":loc, "price_per_night":max_ppn,      "amenities":["wifi","pool","breakfast"],"rating":4.5,"book_on":"Booking.com","highlight":"Best comfort"},
+                {"tier":"Budget",    "name":f"Budget Hotel {loc}",  "stars":"3★","location":loc,"price_per_night":max_per_night*0.5,  "amenities":["wifi"],"rating":3.5,"book_on":"Booking.com","highlight":"Affordable"},
+                {"tier":"Mid-range", "name":f"Comfort Inn {loc}",   "stars":"3★","location":loc,"price_per_night":max_per_night*0.75, "amenities":["wifi","breakfast"],"rating":4.0,"book_on":"MakeMyTrip","highlight":"Good value"},
+                {"tier":"Premium",   "name":f"Grand Hotel {loc}",   "stars":"4★","location":loc,"price_per_night":max_per_night,      "amenities":["wifi","pool","breakfast"],"rating":4.5,"book_on":"Booking.com","highlight":"Best comfort"},
             ]
 
     return {

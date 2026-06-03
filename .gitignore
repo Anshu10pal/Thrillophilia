@@ -1,12 +1,39 @@
+# Environment and secrets
 backend/.env
 .env
 *.env
+.env.*
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
-frontend/node_modules/
-frontend/dist/
+.venv/
+venv/
+.venv
+env/
+
+# FAISS index (large binary files)
+data/faiss_travel_index/
+
+# Generated outputs
 output/
 *.pdf
-.vscode/
+
+# Cache
+trip_cache/
+*.db
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Testing
 test_*.py
+
+# VS Code
+.vscode/
+
+# Windows
+Thumbs.db
+desktop.ini

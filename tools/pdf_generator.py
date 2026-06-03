@@ -142,7 +142,7 @@ def generate_pdf(state: TripState) -> Dict[str, Any]:
             [Paragraph(trip_title, h1)],
             [Paragraph(f"{source}  →  {destination}", style("Sub", fontSize=15,
               textColor=white, fontName="Helvetica", alignment=TA_CENTER))],
-            [Paragraph(f"{(travel_type or "General").title()} | {travelers} Traveller(s) | {num_days} Days",
+            [Paragraph(f"{travel_type.title()} | {travelers} Traveller(s) | {num_days} Days",
               style("Sub2", fontSize=12, textColor=HexColor("#CBD5E1"), fontName="Helvetica",
                     alignment=TA_CENTER))],
         ],
@@ -545,5 +545,3 @@ def generate_pdf(state: TripState) -> Dict[str, Any]:
         "pdf_path": str(filepath),
         "current_agent": "pdf_generator",
     }
-
-

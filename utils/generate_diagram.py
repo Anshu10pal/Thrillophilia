@@ -1,0 +1,130 @@
+"""
+utils/generate_diagram.py — Generate LangGraph workflow diagram as SVG
+"""
+
+SVG_DIAGRAM = '''<?xml version="1.0" encoding="UTF-8"?>
+<svg width="900" height="720" viewBox="0 0 900 720" xmlns="http://www.w3.org/2000/svg" font-family="Arial, sans-serif">
+  <!-- Background -->
+  <rect width="900" height="720" fill="#F8FAFC" rx="12"/>
+  
+  <!-- Title -->
+  <text x="450" y="36" text-anchor="middle" font-size="20" font-weight="bold" fill="#1E293B">Multi-Agent Trip Planner — LangGraph Architecture</text>
+  <text x="450" y="56" text-anchor="middle" font-size="12" fill="#64748B">LangGraph · GPT-4o-Mini · FAISS · ReportLab</text>
+  
+  <!-- START -->
+  <ellipse cx="450" cy="95" rx="50" ry="22" fill="#1A73E8" stroke="#1557B0" stroke-width="2"/>
+  <text x="450" y="100" text-anchor="middle" font-size="13" font-weight="bold" fill="white">START</text>
+  <line x1="450" y1="117" x2="450" y2="140" stroke="#94A3B8" stroke-width="2" marker-end="url(#arr)"/>
+
+  <!-- Initial Processing Box -->
+  <rect x="270" y="140" width="360" height="70" rx="8" fill="#EFF6FF" stroke="#1A73E8" stroke-width="2"/>
+  <text x="450" y="162" text-anchor="middle" font-size="12" font-weight="bold" fill="#1A73E8">Initial Processing</text>
+  <text x="360" y="182" text-anchor="middle" font-size="10" fill="#475569">① User Input Agent</text>
+  <text x="540" y="182" text-anchor="middle" font-size="10" fill="#475569">② Memory/FAISS Agent</text>
+  <text x="450" y="198" text-anchor="middle" font-size="10" fill="#64748B">Parse query → embed → retrieve top-8 docs</text>
+  <line x1="450" y1="210" x2="450" y2="235" stroke="#94A3B8" stroke-width="2" marker-end="url(#arr)"/>
+
+  <!-- Orchestrator -->
+  <polygon points="450,235 570,275 450,315 330,275" fill="#7C3AED" stroke="#5B21B6" stroke-width="2"/>
+  <text x="450" y="270" text-anchor="middle" font-size="12" font-weight="bold" fill="white">Orchestrator</text>
+  <text x="450" y="286" text-anchor="middle" font-size="10" fill="#DDD6FE">Agent (Supervisor)</text>
+
+  <!-- Orchestrator → Parallel Agents -->
+  <line x1="450" y1="315" x2="450" y2="345" stroke="#7C3AED" stroke-width="2" stroke-dasharray="5,3" marker-end="url(#arr2)"/>
+
+  <!-- Parallel Agents Box -->
+  <rect x="100" y="345" width="700" height="120" rx="8" fill="#F0FDF4" stroke="#0D9488" stroke-width="2"/>
+  <text x="450" y="367" text-anchor="middle" font-size="12" font-weight="bold" fill="#0D9488">Parallel Agent Execution</text>
+  
+  <!-- 6 agent chips -->
+  <rect x="115" y="378" width="100" height="34" rx="6" fill="#0D9488"/>
+  <text x="165" y="397" text-anchor="middle" font-size="9" font-weight="bold" fill="white">③ Weather</text>
+  
+  <rect x="225" y="378" width="100" height="34" rx="6" fill="#0D9488"/>
+  <text x="275" y="397" text-anchor="middle" font-size="9" font-weight="bold" fill="white">④ Transport</text>
+  
+  <rect x="335" y="378" width="100" height="34" rx="6" fill="#0D9488"/>
+  <text x="385" y="397" text-anchor="middle" font-size="9" font-weight="bold" fill="white">⑤ Hotel</text>
+  
+  <rect x="445" y="378" width="100" height="34" rx="6" fill="#0D9488"/>
+  <text x="495" y="397" text-anchor="middle" font-size="9" font-weight="bold" fill="white">⑥ Places</text>
+  
+  <rect x="555" y="378" width="100" height="34" rx="6" fill="#0D9488"/>
+  <text x="605" y="397" text-anchor="middle" font-size="9" font-weight="bold" fill="white">⑦ Budget</text>
+  
+  <rect x="665" y="378" width="120" height="34" rx="6" fill="#0D9488"/>
+  <text x="725" y="397" text-anchor="middle" font-size="9" font-weight="bold" fill="white">⑧ Itinerary</text>
+
+  <text x="450" y="448" text-anchor="middle" font-size="10" fill="#475569">All agents read from TripState · write partial updates · LangGraph merges</text>
+
+  <!-- → Final Review -->
+  <line x1="450" y1="465" x2="450" y2="490" stroke="#94A3B8" stroke-width="2" marker-end="url(#arr)"/>
+  <rect x="310" y="490" width="280" height="44" rx="8" fill="#FEF3C7" stroke="#F59E0B" stroke-width="2"/>
+  <text x="450" y="509" text-anchor="middle" font-size="12" font-weight="bold" fill="#92400E">⑨ Final Review Agent</text>
+  <text x="450" y="525" text-anchor="middle" font-size="10" fill="#78350F">Detect conflicts · budget · completeness</text>
+
+  <!-- → Orchestrator loop -->
+  <line x1="450" y1="534" x2="450" y2="555" stroke="#94A3B8" stroke-width="2" marker-end="url(#arr)"/>
+
+  <!-- Orchestrator Decision -->
+  <rect x="290" y="555" width="320" height="44" rx="8" fill="#FDF2F8" stroke="#7C3AED" stroke-width="2"/>
+  <text x="450" y="574" text-anchor="middle" font-size="12" font-weight="bold" fill="#7C3AED">Orchestrator Decision</text>
+  <text x="450" y="590" text-anchor="middle" font-size="10" fill="#6B21A8">Approved? → PDF  |  Conflict? → Retry</text>
+
+  <!-- Retry arrows -->
+  <path d="M 290 577 Q 200 577 200 400 Q 200 345 270 345" fill="none" stroke="#EF4444" stroke-width="2" stroke-dasharray="6,3" marker-end="url(#arr3)"/>
+  <text x="168" y="460" text-anchor="middle" font-size="9" fill="#EF4444" transform="rotate(-90 168 460)">Retry Hotel/Transport</text>
+
+  <!-- → PDF -->
+  <line x1="450" y1="599" x2="450" y2="625" stroke="#94A3B8" stroke-width="2" marker-end="url(#arr)"/>
+  <rect x="290" y="625" width="320" height="44" rx="8" fill="#FFF7ED" stroke="#F59E0B" stroke-width="2"/>
+  <text x="450" y="644" text-anchor="middle" font-size="12" font-weight="bold" fill="#92400E">⑩ Memory Update + PDF Generator</text>
+  <text x="450" y="660" text-anchor="middle" font-size="10" fill="#78350F">ReportLab 7-section professional report</text>
+
+  <!-- END -->
+  <line x1="450" y1="669" x2="450" y2="690" stroke="#94A3B8" stroke-width="2" marker-end="url(#arr)"/>
+  <ellipse cx="450" cy="706" rx="50" ry="18" fill="#1E293B" stroke="#0F172A" stroke-width="2"/>
+  <text x="450" y="711" text-anchor="middle" font-size="13" font-weight="bold" fill="white">END</text>
+
+  <!-- FAISS sidebar -->
+  <rect x="18" y="140" width="120" height="80" rx="8" fill="#EEF2FF" stroke="#4F46E5" stroke-width="1.5"/>
+  <text x="78" y="162" text-anchor="middle" font-size="11" font-weight="bold" fill="#4F46E5">FAISS</text>
+  <text x="78" y="177" text-anchor="middle" font-size="9" fill="#4338CA">Vector Store</text>
+  <text x="78" y="192" text-anchor="middle" font-size="9" fill="#6366F1">24 travel docs</text>
+  <text x="78" y="207" text-anchor="middle" font-size="9" fill="#6366F1">text-embed-3-small</text>
+  <line x1="138" y1="180" x2="270" y2="180" stroke="#4F46E5" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arr4)"/>
+
+  <!-- State sidebar -->
+  <rect x="762" y="140" width="125" height="80" rx="8" fill="#FFF1F2" stroke="#EF4444" stroke-width="1.5"/>
+  <text x="824" y="162" text-anchor="middle" font-size="11" font-weight="bold" fill="#DC2626">TripState</text>
+  <text x="824" y="177" text-anchor="middle" font-size="9" fill="#B91C1C">TypedDict</text>
+  <text x="824" y="192" text-anchor="middle" font-size="9" fill="#B91C1C">Shared by all</text>
+  <text x="824" y="207" text-anchor="middle" font-size="9" fill="#B91C1C">agents via graph</text>
+  <line x1="762" y1="180" x2="630" y2="180" stroke="#EF4444" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arr5)"/>
+
+  <!-- Arrow markers -->
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#94A3B8"/>
+    </marker>
+    <marker id="arr2" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#7C3AED"/>
+    </marker>
+    <marker id="arr3" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#EF4444"/>
+    </marker>
+    <marker id="arr4" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#4F46E5"/>
+    </marker>
+    <marker id="arr5" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#EF4444"/>
+    </marker>
+  </defs>
+</svg>'''
+
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+    out = Path(__file__).parent.parent / "architecture_diagram.svg"
+    out.write_text(SVG_DIAGRAM)
+    print(f"Diagram saved to {out}")

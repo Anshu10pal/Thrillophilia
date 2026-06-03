@@ -1,0 +1,14 @@
+[server]
+# Prevent Streamlit's file-watcher from scanning the entire venv
+# which causes the flood of torchvision/transformers warnings
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false
+
+[logger]
+level = "error"
+
+[runner]
+# Don't scan installed packages for changes
+fastReruns = true

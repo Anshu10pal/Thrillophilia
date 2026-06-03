@@ -795,7 +795,7 @@ def _xotelo_search_location(destination: str) -> Optional[str]:
             timeout=TIMEOUT,
         )
         r.raise_for_status()
-        results = (r.json() or {}).get("result") or {}; results = results.get("list", []) if isinstance(results, dict) else []
+        results = r.json().get("result", {}).get("list", [])
         if results:
             key = results[0].get("key", "")
             logger.info("Xotelo location key for %s: %s", destination, key)
@@ -822,7 +822,7 @@ def fetch_hotel_prices(destination: str,
             timeout=TIMEOUT,
         )
         r.raise_for_status()
-        hotels_raw = (r.json() or {}).get("result") or {}; hotels_raw = hotels_raw.get("list", []) if isinstance(hotels_raw, dict) else []
+        hotels_raw = r.json().get("result", {}).get("list", [])
         if not hotels_raw:
             return None
 
@@ -868,4 +868,3 @@ def fetch_hotel_prices(destination: str,
     except Exception as e:
         logger.error("[LiveAPI] Xotelo list failed for %s: %s", destination, e)
         return None
-
