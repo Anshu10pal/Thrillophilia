@@ -11,6 +11,8 @@ services:
     envVars:
       - key: OPENAI_API_KEY
         sync: false
+      - key: OPENAI_BASE_URL
+        sync: false   # e.g. https://keygateway.arshnivlabs.com/v1
       - key: OPENWEATHER_API_KEY
         sync: false
       - key: GEOAPIFY_API_KEY
