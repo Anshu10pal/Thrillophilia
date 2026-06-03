@@ -1,5 +1,5 @@
 import axios from 'axios'
-const BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+const BASE = import.meta.env.VITE_API_URL || ''
 export const api = axios.create({ baseURL: `${BASE}/api`, timeout: 30000 })
 export const planTrip        = d => api.post('/plan', d)
 export const getPlanResult   = id => api.get(`/plan/${id}`)
