@@ -1,0 +1,46 @@
+services:
+  # ── FastAPI Backend ──────────────────────────────────────────────────────────
+  - type: web
+    name: thrillophilia-api
+    env: python
+    region: singapore
+    plan: free
+    rootDir: backend
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENWEATHER_API_KEY
+        sync: false
+      - key: GEOAPIFY_API_KEY
+        sync: false
+      - key: OPENROUTE_API_KEY
+        sync: false
+      - key: UPSTASH_REDIS_URL
+        sync: false
+      - key: LANGCHAIN_API_KEY
+        sync: false
+      - key: LANGCHAIN_TRACING_V2
+        value: "true"
+      - key: LANGCHAIN_ENDPOINT
+        value: https://api.smith.langchain.com
+      - key: LANGCHAIN_PROJECT
+        value: Thrillophilia-TripPlanner
+      - key: ALLOWED_ORIGINS
+        sync: false   # set to your Render static site URL
+
+  # ── React Frontend ───────────────────────────────────────────────────────────
+  - type: web
+    name: thrillophilia-frontend
+    env: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_URL
+        sync: false   # set to your FastAPI Render URL e.g. https://thrillophilia-api.onrender.com
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
