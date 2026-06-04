@@ -70,6 +70,35 @@ async def health():
     return {"status": "healthy" if ok else "degraded", "redis": "connected" if ok else "disconnected"}
 
 
+@app.get("/api/debug/config")
+async def debug_config():
+    """Shows which env vars are set (values masked). Useful for diagnosing missing keys."""
+    import os
+    keys = ["OPENAI_API_KEY", "OPENAI_BASE_URL", "UPSTASH_REDIS_URL",
+            "LANGCHAIN_API_KEY", "LANGCHAIN_TRACING_V2", "LLM_MODEL"]
+    return {
+        k: ("✓ set" if os.getenv(k) else "✗ NOT SET")
+        for k in keys
+    }
+
+
+@app.get("/api/debug/job/{job_id}")
+async def debug_job(job_id: str):
+    """Shows full status + events for a job. Paste job_id from the UI."""
+    from services.cache_service import cache
+    status = await cache.get_job_status(job_id)
+    events = await cache.get_job_events(job_id)
+    result = await cache.get_plan_result(job_id)
+    return {
+        "job_id": job_id,
+        "status": status,
+        "event_count": len(events),
+        "events": events[-10:],   # last 10 events
+        "has_result": result is not None,
+        "result_keys": list(result.keys()) if result else [],
+    }
+
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
     logger.error("Unhandled exception: %s", exc, exc_info=True)
