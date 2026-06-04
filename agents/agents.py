@@ -102,13 +102,13 @@ except ImportError:
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-def get_llm(max_tokens: int = None) -> ChatOpenAI:
+def get_llm(max_tokens: int = None, timeout: int = 90) -> ChatOpenAI:
     kwargs = dict(
         model=LLM_MODEL,
         temperature=LLM_TEMPERATURE,
         max_tokens=max_tokens or LLM_MAX_TOKENS,
         openai_api_key=OPENAI_API_KEY,
-        timeout=30,
+        timeout=timeout,
         max_retries=0,
     )
     if OPENAI_BASE_URL:
@@ -118,17 +118,17 @@ def get_llm(max_tokens: int = None) -> ChatOpenAI:
 @traceable(name="llm_call_standard", run_type="llm")
 def _llm_call(system: str, human: str) -> str:
     try:
-        llm  = get_llm()
+        llm  = get_llm(timeout=90)
         resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=human)])
         return resp.content.strip()
     except Exception as e:
         logger.error("[LLM] Call failed: %s", e)
         return ""
 
-@traceable(name="llm_call_high_tokens", run_type="llm", metadata={"max_tokens": 8000})
-def _llm_call_high_tokens(system: str, human: str, max_tokens: int = 8000) -> str:
+@traceable(name="llm_call_high_tokens", run_type="llm", metadata={"max_tokens": 4000})
+def _llm_call_high_tokens(system: str, human: str, max_tokens: int = 4000) -> str:
     try:
-        llm  = get_llm(max_tokens=max_tokens)
+        llm  = get_llm(max_tokens=max_tokens, timeout=120)
         resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=human)])
         return resp.content.strip()
     except Exception as e:
@@ -991,8 +991,8 @@ def itinerary_agent(state: TripState) -> Dict[str, Any]:
         f"Weather:{conditions} Attractions:{attractions} Restaurants:{restaurants}"
     )
 
-    logger.info("[ItineraryAgent] Calling LLM (max_tokens=8000) for %d-day itinerary", num_days)
-    raw = _llm_call_high_tokens(system, human, max_tokens=8000)
+    logger.info("[ItineraryAgent] Calling LLM (max_tokens=4000) for %d-day itinerary", num_days)
+    raw = _llm_call_high_tokens(system, human, max_tokens=4000)
 
     try:
         itinerary  = _parse_json_robust(raw)

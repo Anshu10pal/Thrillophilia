@@ -26,19 +26,24 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from config import OPENAI_API_KEY, LLM_MODEL, LLM_TEMPERATURE, MAX_RETRY_PER_AGENT, MAX_ORCHESTRATOR_ITERATIONS
+from config import OPENAI_API_KEY, OPENAI_BASE_URL, LLM_MODEL, LLM_TEMPERATURE, MAX_RETRY_PER_AGENT, MAX_ORCHESTRATOR_ITERATIONS
 from state import TripState
 
 logger = logging.getLogger("trip_planner.orchestrator")
 
 
 def get_llm() -> ChatOpenAI:
-    return ChatOpenAI(
+    kwargs = dict(
         model=LLM_MODEL,
-        temperature=0.1,           # Low temp for deterministic routing
+        temperature=0.1,
         max_tokens=500,
         openai_api_key=OPENAI_API_KEY,
+        timeout=60,
+        max_retries=0,
     )
+    if OPENAI_BASE_URL:
+        kwargs["base_url"] = OPENAI_BASE_URL
+    return ChatOpenAI(**kwargs)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
