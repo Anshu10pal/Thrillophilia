@@ -60,15 +60,17 @@ def budget_tier(amount: float, currency: str = "INR") -> str:
 
 
 class CacheService:
-    """Async Redis cache with typed get/set methods for each data layer."""
+    """Async Redis cache with typed get/set methods for each data layer.
+    Falls back to an in-memory dict when Redis is not configured."""
 
     def __init__(self):
         self._redis: Optional[aioredis.Redis] = None
         self._url = os.getenv("UPSTASH_REDIS_URL") or os.getenv("REDIS_URL", "")
+        self._mem: Dict[str, Any] = {}   # in-memory fallback
 
     async def connect(self):
         if not self._url:
-            logger.warning("No REDIS_URL set — cache disabled (NullCache mode)")
+            logger.warning("No REDIS_URL set — using in-memory store (data lost on restart)")
             return
         try:
             self._redis = aioredis.from_url(
@@ -81,7 +83,7 @@ class CacheService:
             await self._redis.ping()
             logger.info("Redis connected: %s", self._url[:40] + "…")
         except Exception as e:
-            logger.warning("Redis connection failed: %s — running without cache", e)
+            logger.warning("Redis connection failed: %s — using in-memory store", e)
             self._redis = None
 
     async def disconnect(self):
@@ -90,7 +92,7 @@ class CacheService:
 
     async def ping(self) -> bool:
         if not self._redis:
-            return False
+            return True   # in-memory is always "up"
         try:
             return await self._redis.ping()
         except Exception:
@@ -100,7 +102,10 @@ class CacheService:
 
     async def get(self, key: str) -> Optional[Any]:
         if not self._redis:
-            return None
+            val = self._mem.get(key)
+            if val is not None:
+                logger.debug("MEM HIT: %s", key)
+            return val
         try:
             raw = await self._redis.get(key)
             if raw:
@@ -112,13 +117,15 @@ class CacheService:
 
     async def set(self, key: str, value: Any, ttl: int = 3600) -> bool:
         if not self._redis:
-            return False
+            self._mem[key] = value
+            logger.debug("MEM SET: %s", key)
+            return True
         try:
             payload = json.dumps(value, default=str)
             if ttl and ttl > 0:
                 await self._redis.setex(key, ttl, payload)
             else:
-                await self._redis.set(key, payload)  # no expiry
+                await self._redis.set(key, payload)
             logger.debug("CACHE SET: %s (TTL=%ds)", key, ttl)
             return True
         except Exception as e:
@@ -127,7 +134,8 @@ class CacheService:
 
     async def delete(self, key: str) -> bool:
         if not self._redis:
-            return False
+            self._mem.pop(key, None)
+            return True
         try:
             await self._redis.delete(key)
             return True
@@ -201,9 +209,13 @@ class CacheService:
 
     async def add_recent_plan(self, session_id: str, plan_id: str):
         """Add plan_id to front of recent list, keep max 6."""
-        if not self._redis:
-            return
         key = f"recent:{session_id}"
+        if not self._redis:
+            lst = self._mem.setdefault(key, [])
+            if plan_id not in lst:
+                lst.insert(0, plan_id)
+            self._mem[key] = lst[:MAX_RECENT]
+            return
         try:
             await self._redis.lpush(key, plan_id)
             await self._redis.ltrim(key, 0, MAX_RECENT - 1)
@@ -212,9 +224,9 @@ class CacheService:
             logger.warning("add_recent_plan error: %s", e)
 
     async def get_recent_plan_ids(self, session_id: str) -> List[str]:
-        if not self._redis:
-            return []
         key = f"recent:{session_id}"
+        if not self._redis:
+            return self._mem.get(key, [])
         try:
             return await self._redis.lrange(key, 0, MAX_RECENT - 1)
         except Exception:
@@ -248,9 +260,10 @@ class CacheService:
 
     async def append_job_event(self, job_id: str, event: Dict):
         """Append SSE event to job's event list."""
-        if not self._redis:
-            return
         key = f"events:{job_id}"
+        if not self._redis:
+            self._mem.setdefault(key, []).append(event)
+            return
         try:
             await self._redis.rpush(key, json.dumps(event, default=str))
             await self._redis.expire(key, 3600)
@@ -258,9 +271,9 @@ class CacheService:
             logger.warning("append_job_event error: %s", e)
 
     async def get_job_events(self, job_id: str, from_index: int = 0) -> List[Dict]:
-        if not self._redis:
-            return []
         key = f"events:{job_id}"
+        if not self._redis:
+            return self._mem.get(key, [])[from_index:]
         try:
             raw_list = await self._redis.lrange(key, from_index, -1)
             return [json.loads(r) for r in raw_list]
