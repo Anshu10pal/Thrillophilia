@@ -57,6 +57,9 @@ app.include_router(styles_router,  prefix="/api", tags=["Travel Styles"])
 
 @app.get("/")
 async def root():
+    index = Path(__file__).parent.parent / "frontend" / "dist" / "index.html"
+    if index.exists():
+        return FileResponse(str(index))
     return {"status": "ok", "service": "Thrillophilia API v2.0"}
 
 
