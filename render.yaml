@@ -5,7 +5,7 @@ services:
     region: singapore
     plan: free
     buildCommand: cd frontend && npm install && npm run build && cd .. && pip install --no-cache-dir -r backend/requirements.txt
-    startCommand: cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT
+    startCommand: cd backend && python -m uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: OPENAI_API_KEY
         sync: false
